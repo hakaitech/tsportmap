@@ -1,0 +1,144 @@
+# One tsportmap node relaying in both directions at once.
+#
+#   egress  ("out"): containers in this project reach the tailnet host "db-1"
+#                    by connecting to tsportmap:5432 on the project network.
+#   ingress ("in"):  a tailnet peer reaches the "app" container by connecting
+#                    to this node's tailnet address on port 443.
+#
+# Run from the repository root:
+#     docker compose -f deploy/docker-compose.yml up -d
+#
+# Only the two mappings declared below work. tsportmap has no SOCKS5 and no
+# HTTP CONNECT, so nothing else on either network is reachable through it.
+
+name: tsportmap
+
+services:
+  tsportmap:
+    build:
+      # The build context is the repository root, one level up from this file.
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+
+    environment:
+      # Becomes the node's name in the tailnet and in MagicDNS.
+      TSPM_HOSTNAME: tsportmap-compose
+
+      # Read from the mounted secret rather than given inline. An inline value
+      # shows up in "docker inspect", in this file's git history, and in
+      # /proc/<pid>/environ of the running process; the file: prefix keeps the
+      # credential to exactly one file on disk.
+      TSPM_AUTHKEY: file:/run/secrets/tsportmap_authkey
+
+      # A tagged node has key expiry disabled, which is what a long-lived relay
+      # wants. Required outright if the auth key above is an OAuth client secret.
+      TSPM_TAGS: tag:proxy
+
+      # Matches the volume mount below. Always set, and never left empty: with
+      # no Dir, tsnet falls back to os.UserConfigDir(), which fails outright in
+      # a container with no $HOME.
+      TSPM_STATE_DIR: /var/lib/tsportmap
+
+      # false because the volume below is durable: the node keeps one identity
+      # across restarts instead of registering a fresh one each time.
+      TSPM_EPHEMERAL: "false"
+
+      # Refuse to dial an "out" target that is not a tailnet peer. tsnet's
+      # dialer does not fail closed — an unknown destination falls through to a
+      # plain dial on the container's own network — so without this a typo in
+      # the target below would quietly connect to some other container on the
+      # bridge instead of erroring.
+      TSPM_REQUIRE_TAILNET_DEST: "true"
+
+      # ---- egress -------------------------------------------------------
+      # Format: <proto>,<listen>,<target>[,<key>=<value>]...
+      #
+      # The listen host is required on an "out" mapping and there is no default,
+      # because no default is safe everywhere. 0.0.0.0 is right here: the
+      # clients are sibling containers on the compose bridge, so 127.0.0.1 would
+      # reach nothing. allow= then narrows the source range to that bridge
+      # subnet (pinned under "networks" below), so a container attached to some
+      # other network cannot use the mapping.
+      TSPM_OUT_POSTGRES: tcp,0.0.0.0:5432,db-1:5432,allow=172.28.0.0/16,idle=30m
+
+      # ---- ingress ------------------------------------------------------
+      # The listen host is omitted, which means "this node's own tailnet
+      # addresses" — the one place a bare :port is the correct spelling.
+      #
+      # tls=true terminates TLS with the node's Tailscale-issued certificate, so
+      # the "app" container behind it only ever speaks plain HTTP. It needs
+      # MagicDNS and HTTPS certificates enabled on the tailnet, and is valid
+      # only on an in+tcp mapping.
+      TSPM_IN_APP: tcp,:443,app:8080,tls=true,idle=5m
+
+      # Bound to 0.0.0.0 so sibling containers can scrape it. /healthz, /readyz
+      # and /metrics are unauthenticated, which is why the default is loopback;
+      # widening it is only acceptable on a private network like this one.
+      TSPM_METRICS_ADDR: 0.0.0.0:9090
+
+      TSPM_LOG_LEVEL: info
+
+    secrets:
+      - tsportmap_authkey
+
+    volumes:
+      - tsportmap-state:/var/lib/tsportmap
+
+    # tsnet is a userspace network stack. Unlike the kernel Tailscale client it
+    # needs no /dev/net/tun, no NET_ADMIN, and no capabilities at all.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+    # The state volume is the only path the process needs to write.
+    read_only: true
+    tmpfs:
+      # read_only leaves no writable temp space, and os.CreateTemp anywhere in
+      # the stack assumes one exists.
+      - /tmp
+
+    # No healthcheck: the image is distroless and has neither a shell nor an
+    # HTTP client to run one with. Probe port 9090 /healthz from outside the
+    # container instead of writing a check here that cannot execute.
+
+  # Stand-in for whatever this project actually serves. It listens on 8080 and
+  # is reached from the tailnet through the ingress mapping above; it needs no
+  # published port of its own, which is the point.
+  app:
+    image: nginx:1.29-alpine
+    restart: unless-stopped
+
+secrets:
+  tsportmap_authkey:
+    # A file containing the auth key and nothing else — no trailing commentary,
+    # no export line.
+    #
+    # "docker compose" outside swarm bind-mounts this at
+    # /run/secrets/tsportmap_authkey with the host file's own owner and mode;
+    # the uid/gid/mode keys of the swarm secret spec are silently ignored here.
+    # The container runs as UID 65532, so that UID must be able to read it.
+    #
+    # The path is relative to THIS file, not to the directory you run compose
+    # from, so it resolves to deploy/secrets/tsportmap.authkey. Keep that
+    # directory out of version control.
+    #     install -d -m 0700 deploy/secrets
+    #     install -m 0400 -o 65532 /dev/null deploy/secrets/tsportmap.authkey
+    file: ./secrets/tsportmap.authkey
+
+volumes:
+  # Named, so "docker compose down" keeps the node identity and the node comes
+  # back as the same machine. "down -v" destroys it, after which the node
+  # re-registers with a new machine key and the old entry lingers in the admin
+  # console until it is removed.
+  tsportmap-state:
+
+networks:
+  default:
+    ipam:
+      config:
+        # Pinned so the allow= prefix on the egress mapping above refers to a
+        # subnet that is actually guaranteed, rather than whatever Docker
+        # happened to hand out.
+        - subnet: 172.28.0.0/16

@@ -1,0 +1,18 @@
+# Deny everything, then admit only what the build actually compiles.
+#
+# An allow-list rather than a deny-list because the things that must never enter
+# a build context here are exactly the things nobody remembers to add: a
+# tailscale auth key dropped in the working tree, a ./state directory holding a
+# live node identity, a .env written during debugging. A missed deny-list entry
+# bakes those into an image layer; a missed allow-list entry only breaks the
+# build.
+*
+
+!go.mod
+!go.sum
+!cmd/
+!internal/
+!LICENSE
+
+# .git stays excluded, which is why the build passes -buildvcs=false and takes
+# the version as a build argument.

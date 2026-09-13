@@ -7,8 +7,11 @@ package relay
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
+	"os"
+	"syscall"
 	"time"
 )
 
@@ -70,4 +73,63 @@ func Allowed(prefixes []netip.Prefix, addr net.Addr) bool {
 		}
 	}
 	return false
+}
+
+// Reasons are the closed set of values a Recorder ever receives for a dial
+// failure or a rejection.
+//
+// The set lives here, in the package that produces the values, rather than in
+// the package that exposes them. A relay is free to phrase a log line for a
+// human however it likes, but the string handed to a Recorder is one of these
+// constants, so a metrics backend can treat "reason" as a bounded label without
+// a translation table that silently rots when a phrase is reworded.
+const (
+	// ReasonAllowList is a source address outside a mapping's allow list.
+	ReasonAllowList = "allow_list"
+	// ReasonCanceled is a dial abandoned because its context was cancelled,
+	// which normally means the process is shutting down rather than that
+	// anything failed.
+	ReasonCanceled = "canceled"
+	// ReasonDNS is a name that could not be resolved.
+	ReasonDNS = "dns"
+	// ReasonDialTimeout is an onward dial that ran out of time.
+	ReasonDialTimeout = "dial_timeout"
+	// ReasonNotTailnet is a destination that could not be confirmed as a
+	// tailnet peer or an eligible route, so the dial was refused rather than
+	// allowed to fall through to the host network.
+	ReasonNotTailnet = "not_tailnet"
+	// ReasonOther is every reason not named here.
+	ReasonOther = "other"
+	// ReasonRefused is an onward dial actively refused by the target.
+	ReasonRefused = "refused"
+	// ReasonSessionCap is a session refused because the session table was
+	// already at its limit.
+	ReasonSessionCap = "session_cap"
+)
+
+// ReasonForError classifies a dial error into the closed reason set.
+//
+// This is the only classifier in the codebase. The error text itself is never
+// used as a label: it embeds addresses and ports, and an unbounded label mints
+// a new time series per connection.
+func ReasonForError(err error) string {
+	if err == nil {
+		return ReasonOther
+	}
+	var dnsErr *net.DNSError
+	var netErr net.Error
+	switch {
+	case errors.Is(err, context.Canceled):
+		return ReasonCanceled
+	case errors.As(err, &dnsErr):
+		return ReasonDNS
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, os.ErrDeadlineExceeded):
+		return ReasonDialTimeout
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return ReasonRefused
+	case errors.As(err, &netErr) && netErr.Timeout():
+		return ReasonDialTimeout
+	default:
+		return ReasonOther
+	}
 }

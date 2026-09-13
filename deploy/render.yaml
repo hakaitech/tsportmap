@@ -1,0 +1,148 @@
+# Render Blueprint: tsportmap as a private service.
+#
+# Render reads a Blueprint from render.yaml at the repository root, so copy or
+# symlink this file there; this copy is the reviewed source. Everything below is
+# written against how Render actually behaves, including the parts that are
+# inconvenient.
+
+services:
+  # A private service, not a web service. A web service terminates HTTP on a
+  # single port and publishes it to the internet; tsportmap relays arbitrary TCP
+  # on however many ports the operator declared, and must not be public. Render
+  # private services accept connections only from other services in the same
+  # account and region.
+  - type: pserv
+    name: tsportmap
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: starter
+
+    # Must match the region of every service that talks to this one: Render's
+    # private network does not span regions, and there is no error for getting
+    # this wrong — the name simply does not resolve.
+    region: oregon
+
+    # A redeploy tears the node down and brings a new one up. With the disk
+    # attached below that is a hard cutover, so make it a decision rather than a
+    # side effect of a push.
+    autoDeploy: false
+
+    # Pinned at 1, and not by preference: a Render disk attaches to exactly one
+    # instance, so the disk below forbids scaling past a single instance anyway.
+    numInstances: 1
+
+    # No healthCheckPath. Render applies that setting to web services; a private
+    # service is judged live by whether it has opened a TCP port, and nothing
+    # ever fetches a path. Declaring one here would document an intent that
+    # nothing enforces. tsportmap does serve /healthz and /readyz on
+    # TSPM_METRICS_ADDR — worth curling from a sibling service, but it is not
+    # what gates the deploy.
+    #
+    # Render also waits for at least one open port before marking a deploy live,
+    # and injects a PORT variable that tsportmap ignores: there is no implicit
+    # listener, every port comes from a declared mapping. The metrics listener
+    # below is bound to 0.0.0.0 partly so that a node with only ingress mappings
+    # still has a port open for Render to find.
+
+    envVars:
+      # sync: false means Render prompts for this value once and never stores it
+      # in the repository. Never inline an auth key here.
+      #
+      # The value may also be "file:/path"; on Render that requires a secret
+      # file mounted at that path, which is more moving parts than it is worth
+      # for a single credential.
+      - key: TSPM_AUTHKEY
+        sync: false
+
+      - key: TSPM_HOSTNAME
+        value: tsportmap-render
+
+      # Tagged nodes have key expiry disabled, which is what a service that is
+      # expected to stay up for months needs. Required if TSPM_AUTHKEY holds an
+      # OAuth client secret rather than an auth key.
+      - key: TSPM_TAGS
+        value: tag:proxy
+
+      # Must equal the disk mountPath below.
+      - key: TSPM_STATE_DIR
+        value: /var/lib/tsportmap
+
+      # false because the disk below is durable. Flip this to true if you delete
+      # the disk — see the trade-off note there.
+      - key: TSPM_EPHEMERAL
+        value: "false"
+
+      # Leave this on. Render's private network is RFC1918 10.x, and tsnet's
+      # dialer does not fail closed: a destination that is not a tailnet peer
+      # falls through to a plain dial on that private network. Without the guard
+      # a mistyped target below would connect to a neighbouring Render service
+      # of yours and relay to it happily — wrong backend, no error, no log line.
+      # This platform is the reason the guard exists.
+      - key: TSPM_REQUIRE_TAILNET_DEST
+        value: "true"
+
+      # Bound to 0.0.0.0 so sibling services can reach /healthz and /metrics.
+      # These endpoints are unauthenticated; that is tolerable only because a
+      # private service is not routable from the internet.
+      - key: TSPM_METRICS_ADDR
+        value: 0.0.0.0:9090
+
+      # ---- egress ---------------------------------------------------------
+      # Format: <proto>,<listen>,<target>[,<key>=<value>]...
+      #
+      # Other Render services in this region reach the tailnet host "db-1" by
+      # connecting to tsportmap:5432.
+      #
+      # The listen host is 0.0.0.0 and MUST NOT be ::. Render's private network
+      # is IPv4-only, so a v6-only bind opens a socket nothing can ever connect
+      # to and the deploy looks healthy while being unreachable.
+      #
+      # allow= restricts the source range. 10.0.0.0/8 is Render's private
+      # network as a whole, which is every service in your account and region —
+      # the honest reading of that is "any of my services may use this mapping",
+      # not "this is locked down".
+      - key: TSPM_OUT_POSTGRES
+        value: tcp,0.0.0.0:5432,db-1:5432,allow=10.0.0.0/8,idle=30m
+
+      # ---- ingress --------------------------------------------------------
+      # A tailnet peer reaches a Render service through this node. The listen
+      # host is omitted, meaning the node's own tailnet addresses — Render's
+      # IPv4-only constraint does not apply to this side, because the socket
+      # lives on tsnet's userspace stack rather than on Render's network.
+      #
+      # The target is an ordinary Render private-service address, resolved and
+      # dialled over Render's IPv4 network.
+      #
+      # tls=true terminates TLS with the node's Tailscale certificate and
+      # requires MagicDNS plus HTTPS certificates enabled on the tailnet. Valid
+      # only on in+tcp.
+      - key: TSPM_IN_APP
+        value: tcp,:443,internal-api:8080,tls=true,idle=5m
+
+      - key: TSPM_LOG_LEVEL
+        value: info
+
+    # The node's identity lives here. Attaching a disk buys one stable machine
+    # key, one MagicDNS name and one certificate across deploys — and costs
+    # real things:
+    #
+    #   * A disk attaches to a single instance, so the service can never scale
+    #     past numInstances: 1.
+    #   * Deploys stop being zero-downtime. Render must stop the running
+    #     instance before the replacement can mount the disk, so every mapping
+    #     is down for the gap between the two — seconds to a minute.
+    #
+    # The alternative is to delete this block and set TSPM_EPHEMERAL=true. Then
+    # deploys overlap cleanly, but every deploy registers a brand-new node:
+    # a new machine key, a fresh certificate issuance, and — while old and new
+    # briefly coexist — two nodes wanting the same hostname, so MagicDNS gives
+    # one of them a numeric suffix. Peers that address this node by an exact
+    # MagicDNS name will miss it during that window; ACL rules keyed on the tag
+    # keep working. Control reaps the ephemeral nodes once they disconnect.
+    disk:
+      name: tsportmap-state
+      mountPath: /var/lib/tsportmap
+      # tsnet stores a machine key, a prefs file and a log buffer. The smallest
+      # disk Render sells is already far more than that needs.
+      sizeGB: 1

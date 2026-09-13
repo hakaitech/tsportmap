@@ -1,0 +1,93 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Nothing here publishes anything, so the token gets read access and no more.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: go
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          # Follows the module's own "go 1.26.6" directive instead of pinning a
+          # version here that would silently drift from go.mod.
+          go-version-file: go.mod
+          # Caches both the module cache and the build cache, keyed on go.sum.
+          # It is the default; stated so its absence would be a visible edit
+          # rather than an oversight. tailscale.com is a large dependency and
+          # this is most of the job's wall time.
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      # -race because every relay session is a pair of goroutines sharing a
+      # session table and a metrics recorder.
+      - name: go test
+        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: coverage summary
+        run: go tool cover -func=coverage.out | tail -n 1 >> "$GITHUB_STEP_SUMMARY"
+
+      # Last of the Go steps on purpose: it rewrites go.mod and go.sum in place,
+      # so any step after it would be running against a mutated tree.
+      # tailscale.com is meant to be the only third-party dependency, and a diff
+      # here is how a second one — or a stale require line — gets caught.
+      - name: go mod tidy is clean
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+  docker:
+    name: docker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Needed for the multi-platform build and for the Dockerfile's cache
+      # mounts; the default docker driver cannot do either.
+      - uses: docker/setup-buildx-action@v4
+
+      # No QEMU setup, deliberately: the builder stage is pinned to
+      # $BUILDPLATFORM and cross-compiles with the Go toolchain, and the runtime
+      # stage only copies files in — nothing ever executes a foreign-arch
+      # binary, so there is nothing to emulate.
+      #
+      # Neither --push nor --load: a multi-platform result cannot be loaded into
+      # the local image store anyway. The build output is discarded and the
+      # point is only that the Dockerfile still builds for both architectures.
+      #
+      # This job recompiles from scratch — its cache mounts are not shared with
+      # the setup-go caches in the job above — so it is slow by construction.
+      - name: docker buildx build
+        run: |
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg VERSION=${{ github.sha }} \
+            --tag tsportmap:ci \
+            .
