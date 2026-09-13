@@ -1,0 +1,5 @@
+/tsportmap
+/dist/
+*.test
+/coverage.out
+/state/
