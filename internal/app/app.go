@@ -36,9 +36,11 @@ import (
 // slow /metrics reader delays the node teardown that actually matters.
 const metricsShutdownTimeout = 5 * time.Second
 
-// forceCloseGrace is how long relays get after their listeners have been closed
-// out from under them. Closing is what unblocks a goroutine parked in Read, so
-// this only has to cover the return trip, not any real work.
+// forceCloseGrace is the upper bound on how long relays get after their
+// listeners and their live sessions have been closed out from under them.
+// Closing is what unblocks a goroutine parked in Read, so this only has to
+// cover the return trip, not any real work, and shutdown returns as soon as
+// the relays are actually done rather than waiting the window out.
 const forceCloseGrace = 2 * time.Second
 
 // node is the slice of the embedded Tailscale node this package uses.
@@ -208,8 +210,9 @@ func run(ctx context.Context, environ []string, version string, stderr io.Writer
 	if !waitFor(&wg, cfg.ShutdownGrace) {
 		// Cancellation stops the relays accepting but deliberately lets live
 		// sessions finish, and a session with no idle bound can outlast any
-		// grace period. Closing the listeners is the only lever left.
-		logger.Warn("shutdown grace expired with sessions still open, closing listeners", "grace", cfg.ShutdownGrace)
+		// grace period. Closing them out from under the relays is the only
+		// lever left.
+		logger.Warn("shutdown grace expired with sessions still open, closing them", "grace", cfg.ShutdownGrace)
 		closeBounds(bounds)
 		if !waitFor(&wg, forceCloseGrace) {
 			logger.Warn("relays did not stop after their listeners were closed; exiting anyway")
@@ -242,9 +245,21 @@ type bound struct {
 	dial relay.DialFunc
 }
 
+// close makes this mapping stop, up to and including the sessions it has
+// already accepted.
+//
+// Closing the listener alone is not enough for TCP: relay.ServeTCP owns its
+// listener and closes it as it returns, so by the time shutdown reaches here
+// the listener is already closed and closing it again does nothing at all,
+// while the relay goes on waiting for sessions that may never end on their
+// own. The tracking listener is what still has a handle on those sessions.
 func (b *bound) close() {
 	if b.ln != nil {
-		b.ln.Close()
+		if t, ok := b.ln.(*trackingListener); ok {
+			t.closeSessions()
+		} else {
+			b.ln.Close()
+		}
 	}
 	if b.pc != nil {
 		b.pc.Close()
@@ -268,6 +283,101 @@ func (b *bound) serve(ctx context.Context, cfg *config.Config, rec relay.Recorde
 	// ServeUDP leaves the PacketConn to whoever opened it.
 	defer b.pc.Close()
 	return relay.ServeUDP(ctx, b.pc, b.dial, opts)
+}
+
+// trackingListener is a net.Listener that remembers the connections it has
+// handed out, so that shutdown can close them once the grace period is spent.
+//
+// The relay hands each accepted connection straight to a session goroutine and
+// never exposes it, and a session with no idle bound can outlive any grace
+// period, so wrapping the listener is the only place from which those
+// connections can still be reached.
+type trackingListener struct {
+	net.Listener
+
+	mu     sync.Mutex
+	closed bool
+	conns  map[net.Conn]struct{}
+}
+
+func newTrackingListener(ln net.Listener) *trackingListener {
+	return &trackingListener{Listener: ln, conns: make(map[net.Conn]struct{})}
+}
+
+func (l *trackingListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		c.Close()
+		// A connection that raced the force close is dropped rather than
+		// served. net.ErrClosed is what the relay already reads as "the
+		// listener is gone, stop accepting".
+		return nil, net.ErrClosed
+	}
+	l.conns[c] = struct{}{}
+	l.mu.Unlock()
+	return trackConn(l, c), nil
+}
+
+func (l *trackingListener) forget(c net.Conn) {
+	l.mu.Lock()
+	delete(l.conns, c)
+	l.mu.Unlock()
+}
+
+// closeSessions closes the listener and every session still running on it, and
+// refuses to hand out any more.
+func (l *trackingListener) closeSessions() {
+	l.Listener.Close()
+
+	l.mu.Lock()
+	l.closed = true
+	conns := make([]net.Conn, 0, len(l.conns))
+	for c := range l.conns {
+		conns = append(conns, c)
+	}
+	clear(l.conns)
+	l.mu.Unlock()
+
+	for _, c := range conns {
+		c.Close()
+	}
+}
+
+// trackedConn deregisters itself when the relay closes it, so that the set of
+// live sessions does not grow for the lifetime of the process.
+type trackedConn struct {
+	net.Conn
+	l *trackingListener
+}
+
+func (c *trackedConn) Close() error {
+	c.l.forget(c.Conn)
+	return c.Conn.Close()
+}
+
+// trackedCloseWriter preserves CloseWrite for a transport that has it. The
+// relay type-asserts for CloseWrite to propagate a half-close, and a wrapper
+// that hid the method would turn every EOF into a full teardown, truncating
+// the response still coming the other way. The method is exposed only when the
+// wrapped connection really has it, so the assertion keeps answering for the
+// transport rather than for the wrapper.
+type trackedCloseWriter struct{ *trackedConn }
+
+func (c trackedCloseWriter) CloseWrite() error {
+	return c.Conn.(interface{ CloseWrite() error }).CloseWrite()
+}
+
+func trackConn(l *trackingListener, c net.Conn) net.Conn {
+	t := &trackedConn{Conn: c, l: l}
+	if _, ok := c.(interface{ CloseWrite() error }); ok {
+		return trackedCloseWriter{t}
+	}
+	return t
 }
 
 func closeBounds(bounds []*bound) {
@@ -305,7 +415,7 @@ func bindOne(m config.Mapping, n node, ip4, ip6 netip.Addr, reg *obs.Registry) (
 		if err != nil {
 			return nil, fmt.Errorf("listening on %s: %w", m.Listen, err)
 		}
-		b.ln = ln
+		b.ln = newTrackingListener(ln)
 
 	case m.Dir == config.Out && m.Proto == config.UDP:
 		pc, err := net.ListenPacket("udp", m.Listen)
@@ -323,7 +433,7 @@ func bindOne(m config.Mapping, n node, ip4, ip6 netip.Addr, reg *obs.Registry) (
 		if err != nil {
 			return nil, fmt.Errorf("listening on the tailnet at %s: %w", m.Listen, err)
 		}
-		b.ln = ln
+		b.ln = newTrackingListener(ln)
 
 	case m.Dir == config.In && m.Proto == config.UDP:
 		addr, err := ingressPacketAddr(m, ip4, ip6)
@@ -369,14 +479,25 @@ func ingressPacketAddr(m config.Mapping, ip4, ip6 netip.Addr) (string, error) {
 	preferV6 := false
 	if host != "" {
 		addr, perr := netip.ParseAddr(host)
+		// Unmapped before the test: netip.Addr.IsUnspecified compares against
+		// 0.0.0.0 and ::, and answers false for the IPv4-mapped spelling
+		// "::ffff:0.0.0.0" even though it names the same wildcard. The
+		// configuration parser folds that spelling to 0.0.0.0 when it looks
+		// for conflicting binds, so this must read it the same way or a
+		// wildcard the parser recognised would be handed to tsnet, which
+		// rejects it.
+		if perr == nil {
+			addr = addr.Unmap()
+		}
 		if perr != nil || !addr.IsUnspecified() {
 			// A concrete address, or a name tsnet will resolve itself. Either
 			// way it is not a wildcard, so it stands as written.
 			return m.Listen, nil
 		}
 		// "[::]" asks for the IPv6 stack, so honour that preference when the
-		// node has an address in both families.
-		preferV6 = addr.Is6() && !addr.Is4In6()
+		// node has an address in both families. An unmapped "::ffff:0.0.0.0"
+		// is an IPv4 address and expresses no such preference.
+		preferV6 = addr.Is6()
 	}
 
 	order := [2]netip.Addr{ip4, ip6}
@@ -520,7 +641,117 @@ func Validate(environ []string, version string, w io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("configuration: %w", err)
 	}
+	if err := checkStartup(environ, cfg); err != nil {
+		return err
+	}
 	return writeSummary(w, cfg, version)
+}
+
+// oauthSecretPrefix is the prefix Tailscale gives OAuth client secrets. tsnet
+// exchanges a secret with this prefix for an auth key rather than presenting
+// it as one, and the minted key has to be tagged, so tsnode refuses the
+// combination of such a secret and no tags. The prefix is repeated here rather
+// than shared because this is a copy of a rule owned by tsnet, not by us.
+const oauthSecretPrefix = "tskey-client-"
+
+// checkStartup reports the configurations that parse cleanly but cannot start.
+//
+// The parser's job ends at the mappings' own consistency; these are conflicts
+// between a mapping and something outside it. They belong here because the
+// point of --validate is to be a gate: a configuration it passes and startup
+// then rejects is worse than no gate at all, and each of these fails at a
+// point where the error names a symptom rather than the setting at fault.
+func checkStartup(environ []string, cfg *config.Config) error {
+	if strings.HasPrefix(cfg.AuthKey, oauthSecretPrefix) && len(cfg.Tags) == 0 {
+		return fmt.Errorf("%s holds an OAuth client secret (it begins %q) but %s is empty: "+
+			"the auth key minted from a client secret is always tagged, so the node cannot register without tags. "+
+			"Set %s to the tags the OAuth client is authorised for, for example %s=tag:proxy",
+			config.EnvAuthKey, oauthSecretPrefix, config.EnvTags, config.EnvTags, config.EnvTags)
+	}
+	return checkStatusAddrFree(environ, cfg)
+}
+
+// checkStatusAddrFree rejects a mapping that would take the address the status
+// server needs.
+//
+// Only an egress TCP mapping can: an ingress listener is opened inside tsnet's
+// netstack and never touches a host socket, and a UDP bind does not exclude a
+// TCP one. At startup the mappings are bound before the status server, so the
+// operator sees "address already in use" attributed to TSPM_METRICS_ADDR — a
+// variable they very likely never set, since the address in the message is the
+// built-in default.
+func checkStatusAddrFree(environ []string, cfg *config.Config) error {
+	statusHost, statusPort, err := net.SplitHostPort(cfg.MetricsAddr)
+	if err != nil {
+		// config.FromEnv already accepted this address.
+		return nil
+	}
+
+	// Named so the message can point at whichever of the two an operator can
+	// actually act on.
+	explicit := envValue(environ, config.EnvMetricsAddr) != ""
+
+	for _, m := range cfg.Maps {
+		if m.Dir != config.Out || m.Proto != config.TCP {
+			continue
+		}
+		host, port, err := net.SplitHostPort(m.Listen)
+		if err != nil || port != statusPort {
+			continue
+		}
+		if !hostsOverlap(host, statusHost) {
+			continue
+		}
+		if explicit {
+			return fmt.Errorf("mapping %s (%s) listens on %s, which is the status address set by %s (%s); "+
+				"the mappings are bound before the status server, so startup would fail to bind it. "+
+				"Move the mapping to another port, or point %s somewhere else",
+				m.Name, envVarFor(m), m.Listen, config.EnvMetricsAddr, cfg.MetricsAddr, config.EnvMetricsAddr)
+		}
+		return fmt.Errorf("mapping %s (%s) listens on %s, which collides with the DEFAULT status address %s "+
+			"(/healthz, /readyz and /metrics); the mappings are bound before the status server, so startup would fail to bind it "+
+			"and would blame %s, which is not set. Move the mapping to another port, or move the status endpoints by setting "+
+			"%s explicitly, for example %s=127.0.0.1:9091",
+			m.Name, envVarFor(m), m.Listen, config.DefaultMetricsAddr,
+			config.EnvMetricsAddr, config.EnvMetricsAddr, config.EnvMetricsAddr)
+	}
+	return nil
+}
+
+// hostsOverlap reports whether two bind hosts on the same port can claim the
+// same socket. A wildcard on either side covers the other, which is why this
+// is not a string comparison.
+func hostsOverlap(a, b string) bool {
+	if isWildcard(a) || isWildcard(b) {
+		return true
+	}
+	return canonicalHost(a) == canonicalHost(b)
+}
+
+func isWildcard(host string) bool {
+	if host == "" {
+		return true
+	}
+	addr, err := netip.ParseAddr(host)
+	return err == nil && addr.Unmap().IsUnspecified()
+}
+
+func canonicalHost(host string) string {
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return addr.Unmap().String()
+	}
+	return strings.ToLower(host)
+}
+
+// envValue reads one variable out of an os.Environ()-style slice, taking the
+// first occurrence exactly as os.Getenv and the configuration parser do.
+func envValue(environ []string, name string) string {
+	for _, kv := range environ {
+		if k, v, ok := strings.Cut(kv, "="); ok && k == name {
+			return v
+		}
+	}
+	return ""
 }
 
 func writeSummary(w io.Writer, cfg *config.Config, version string) error {
@@ -596,7 +827,10 @@ func mappingNotes(m config.Mapping) []string {
 	}
 	wildcard := host == ""
 	if !wildcard {
-		if addr, perr := netip.ParseAddr(host); perr == nil && addr.IsUnspecified() {
+		// Unmap for the same reason ingressPacketAddr does: "::ffff:0.0.0.0"
+		// is the wildcard, and a note that failed to mention it would leave an
+		// operator to discover the substitution from a running system.
+		if addr, perr := netip.ParseAddr(host); perr == nil && addr.Unmap().IsUnspecified() {
 			wildcard = true
 		}
 	}

@@ -53,19 +53,19 @@ func newGuard(state tailnetState, logger *slog.Logger) *guard {
 // peer can be added, removed or re-addressed at any moment, and a stale "yes"
 // is precisely the wrong answer to cache. The queries go to the in-process
 // local API, so they cost far less than the connection setup that follows.
-func (g *guard) Check(ctx context.Context, host string) (bool, string, error) {
+func (g *guard) Check(ctx context.Context, host string) (bool, string, string, error) {
 	st, err := g.state.Status(ctx)
 	if err != nil {
-		return false, "", fmt.Errorf("reading tailnet status: %w", err)
+		return false, "", "", fmt.Errorf("reading tailnet status: %w", err)
 	}
 	prefs, err := g.state.GetPrefs(ctx)
 	if err != nil {
-		return false, "", fmt.Errorf("reading tailnet prefs: %w", err)
+		return false, "", "", fmt.Errorf("reading tailnet prefs: %w", err)
 	}
 	routeAll := prefs != nil && prefs.RouteAll
-	ok, why := checkDest(st, routeAll, host)
-	g.log.Debug("destination guard decision", "host", host, "allowed", ok, "why", why)
-	return ok, why, nil
+	ok, approved, why := checkDest(st, routeAll, host)
+	g.log.Debug("destination guard decision", "host", host, "approved", approved, "allowed", ok, "why", why)
+	return ok, approved, why, nil
 }
 
 // checkDest is the whole decision, as a pure function of a netmap snapshot.
@@ -74,18 +74,27 @@ func (g *guard) Check(ctx context.Context, host string) (bool, string, error) {
 // a subnet route only carries traffic once this node has accepted it, and
 // status reports routes the control plane approved for a peer whether or not
 // this node uses them.
-func checkDest(st *ipnstate.Status, acceptRoutes bool, host string) (ok bool, why string) {
+//
+// It returns the host in the form the verdict was actually reached on, so a
+// caller can dial exactly what was authorised. The rewrites are not cosmetic:
+// unmapping ::ffff:10.1.2.3 to 10.1.2.3 is what lets it match a subnet route
+// at all, and a dialer handed the mapped spelling would look it up as a
+// different, unmatched address.
+func checkDest(st *ipnstate.Status, acceptRoutes bool, host string) (ok bool, approved string, why string) {
 	h := normaliseHost(host)
 	if h == "" {
-		return false, "the destination host is empty, so it cannot be matched against any tailnet peer"
+		return false, h, "the destination host is empty, so it cannot be matched against any tailnet peer"
 	}
 	if st == nil {
-		return false, fmt.Sprintf("no tailnet status is available, so %q cannot be shown to be a tailnet peer; %s", h, fallthroughWarning)
+		return false, h, fmt.Sprintf("no tailnet status is available, so %q cannot be shown to be a tailnet peer; %s", h, fallthroughWarning)
 	}
 	if ip, err := netip.ParseAddr(h); err == nil {
-		return checkAddr(st, acceptRoutes, ip.Unmap())
+		ip = ip.Unmap()
+		allowed, reason := checkAddr(st, acceptRoutes, ip)
+		return allowed, ip.String(), reason
 	}
-	return checkName(st, h)
+	allowed, reason := checkName(st, h)
+	return allowed, h, reason
 }
 
 // normaliseHost reduces a host as written in a mapping to the form the netmap

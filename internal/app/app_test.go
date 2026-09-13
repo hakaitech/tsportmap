@@ -462,6 +462,89 @@ func TestRunServesMappingsAndShutsDownCleanly(t *testing.T) {
 	}
 }
 
+// hangingDial answers every dial with one end of a pipe whose other end is
+// never read, written or closed. It stands in for a session that will not end
+// on its own: a stream with no traffic, or a peer that went quiet without
+// hanging up.
+func hangingDial(ctx context.Context, network, address string) (net.Conn, error) {
+	local, _ := net.Pipe()
+	return local, nil
+}
+
+// waitMetric polls the status endpoint until the exposition contains want.
+func waitMetric(t *testing.T, status, want string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if strings.Contains(get(t, "http://"+status+"/metrics"), want) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("metric %q never appeared", want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A session that never ends must not cost the whole force-close window.
+//
+// The relay closes its own listener as it returns, so closing the listener
+// again after the grace expires reaches nothing; only closing the accepted
+// connections lets the relay finish. Without that, shutdown always ran the
+// full grace plus forceCloseGrace and then abandoned the session anyway.
+func TestRunForceClosesStuckSessionsWithoutBurningTheWindow(t *testing.T) {
+	const grace = 200 * time.Millisecond
+
+	outTCP := freePort(t)
+	status := freePort(t)
+	n := &stubNode{dial: hangingDial}
+	environ := []string{
+		"TSPM_OUT_DB=tcp," + outTCP + ",db:5432",
+		"TSPM_METRICS_ADDR=" + status,
+		"TSPM_SHUTDOWN_GRACE=" + grace.String(),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var logs syncBuffer
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, environ, "test", &logs, factory(n)) }()
+
+	waitReady(t, status)
+
+	conn, err := net.Dial("tcp", outTCP)
+	if err != nil {
+		t.Fatalf("dialling the egress mapping: %v", err)
+	}
+	defer conn.Close()
+	// The session has to be established before the shutdown, or there would be
+	// nothing for the force close to reach.
+	waitMetric(t, status, `tsportmap_sessions_active{mapping="DB"} 1`)
+
+	start := time.Now()
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("shutdown returned %v, want nil", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run did not return after its context was cancelled")
+	}
+	elapsed := time.Since(start)
+
+	if elapsed < grace {
+		t.Errorf("shutdown took %v, under the configured grace of %v: the live session lost its drain window", elapsed, grace)
+	}
+	// A force close that cannot reach the session costs grace+forceCloseGrace.
+	// Half of the second window is generous room for the relays to unwind.
+	if limit := grace + forceCloseGrace/2; elapsed > limit {
+		t.Errorf("shutdown took %v with one stuck session, want under %v", elapsed, limit)
+	}
+
+	mustBind(t, outTCP)
+}
+
 func TestRunReadinessTracksTheNode(t *testing.T) {
 	status := freePort(t)
 	environ := []string{
@@ -570,6 +653,20 @@ func TestIngressPacketAddr(t *testing.T) {
 			listen: "[::]:5353",
 			ip4:    ip4,
 			want:   "100.64.0.1:5353",
+		},
+		{
+			// config.canonicalHost folds this to 0.0.0.0 when it looks for
+			// conflicting binds, so it has to be a wildcard here too.
+			name:   "IPv4-mapped IPv6 wildcard takes the node's IPv4",
+			listen: "[::ffff:0.0.0.0]:5353",
+			ip4:    ip4, ip6: ip6,
+			want: "100.64.0.1:5353",
+		},
+		{
+			name:   "IPv4-mapped IPv6 wildcard falls back to IPv6",
+			listen: "[::ffff:0.0.0.0]:5353",
+			ip6:    ip6,
+			want:   "[fd7a:115c:a1e0::1]:5353",
 		},
 		{
 			name:   "a concrete address is left alone",
@@ -711,5 +808,237 @@ func TestValidateNeverLeaksAKeyReadFromAFile(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "set (redacted)") {
 		t.Errorf("the summary does not report that a key was supplied:\n%s", out.String())
+	}
+}
+
+func TestMappingNotesTreatAMappedWildcardAsAWildcard(t *testing.T) {
+	t.Parallel()
+
+	notes := mappingNotes(config.Mapping{
+		Name: "DNS", Dir: config.In, Proto: config.UDP, Listen: "[::ffff:0.0.0.0]:53",
+	})
+	joined := strings.Join(notes, "\n")
+	if !strings.Contains(joined, "tsnet rejects for UDP") {
+		t.Errorf("no wildcard note for a mapped wildcard bind: %q", joined)
+	}
+}
+
+// --- validation as a startup gate -------------------------------------------
+
+func TestValidateRejectsAMappingOnTheDefaultStatusAddress(t *testing.T) {
+	t.Parallel()
+
+	for _, listen := range []string{"127.0.0.1:9090", "0.0.0.0:9090", "[::]:9090"} {
+		t.Run(listen, func(t *testing.T) {
+			t.Parallel()
+			var out bytes.Buffer
+			err := Validate([]string{"TSPM_OUT_STATUS=tcp," + listen + ",peer:9090"}, "test", &out)
+			if err == nil {
+				t.Fatalf("Validate accepted a mapping on the default status address:\n%s", out.String())
+			}
+			for _, want := range []string{"TSPM_OUT_STATUS", listen, "DEFAULT status address", config.DefaultMetricsAddr, config.EnvMetricsAddr} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not mention %q", err, want)
+				}
+			}
+			if out.Len() != 0 {
+				t.Errorf("a rejected configuration still produced a summary:\n%s", out.String())
+			}
+		})
+	}
+}
+
+func TestValidateRejectsAMappingOnAnExplicitStatusAddress(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	err := Validate([]string{
+		"TSPM_METRICS_ADDR=127.0.0.1:9999",
+		"TSPM_OUT_STATUS=tcp,0.0.0.0:9999,peer:9999",
+	}, "test", &out)
+	if err == nil {
+		t.Fatalf("Validate accepted a mapping on the configured status address:\n%s", out.String())
+	}
+	for _, want := range []string{"TSPM_OUT_STATUS", "0.0.0.0:9999", "set by " + config.EnvMetricsAddr, "127.0.0.1:9999"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+// Binds that share the status port without being able to take it.
+func TestValidateAcceptsMappingsTheStatusServerCanCoexistWith(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		environ []string
+	}{{
+		// An ingress listener lives in tsnet's netstack, not on a host socket.
+		name:    "ingress on the status address",
+		environ: []string{"TSPM_IN_WEB=tcp,127.0.0.1:9090,127.0.0.1:8080"},
+	}, {
+		name:    "udp on the status port",
+		environ: []string{"TSPM_OUT_DNS=udp,127.0.0.1:9090,dns:53"},
+	}, {
+		name:    "same port on another address",
+		environ: []string{"TSPM_OUT_X=tcp,192.168.1.5:9090,peer:9090"},
+	}, {
+		name: "the status server was moved out of the way",
+		environ: []string{
+			"TSPM_METRICS_ADDR=127.0.0.1:9091",
+			"TSPM_OUT_X=tcp,127.0.0.1:9090,peer:9090",
+		},
+	}}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var out bytes.Buffer
+			if err := Validate(tc.environ, "test", &out); err != nil {
+				t.Fatalf("Validate(%q) = %v, want nil", tc.environ, err)
+			}
+		})
+	}
+}
+
+func TestValidateRejectsAnOAuthSecretWithoutTags(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	err := Validate([]string{
+		"TSPM_AUTHKEY=tskey-client-supersecret",
+		"TSPM_OUT_DB=tcp,127.0.0.1:5432,db:5432",
+	}, "test", &out)
+	if err == nil {
+		t.Fatalf("Validate accepted an OAuth client secret with no tags:\n%s", out.String())
+	}
+	for _, want := range []string{config.EnvAuthKey, config.EnvTags, "OAuth client secret", "tag:proxy"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "supersecret") {
+		t.Fatalf("the error leaked the client secret: %v", err)
+	}
+	if out.Len() != 0 {
+		t.Errorf("a rejected configuration still produced a summary:\n%s", out.String())
+	}
+}
+
+func TestValidateAcceptsAnOAuthSecretWithTags(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	err := Validate([]string{
+		"TSPM_AUTHKEY=tskey-client-supersecret",
+		"TSPM_TAGS=tag:proxy",
+		"TSPM_OUT_DB=tcp,127.0.0.1:5432,db:5432",
+	}, "test", &out)
+	if err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	// A plain auth key is not an OAuth secret and never needs tags.
+	out.Reset()
+	err = Validate([]string{
+		"TSPM_AUTHKEY=tskey-auth-plain",
+		"TSPM_OUT_DB=tcp,127.0.0.1:5432,db:5432",
+	}, "test", &out)
+	if err != nil {
+		t.Fatalf("Validate rejected a plain auth key with no tags: %v", err)
+	}
+}
+
+// --- session tracking -------------------------------------------------------
+
+// pipeListener hands out net.Pipe conns, which have no CloseWrite.
+type pipeListener struct {
+	conns chan net.Conn
+	addr  net.Addr
+}
+
+func (l *pipeListener) Accept() (net.Conn, error) { return <-l.conns, nil }
+func (l *pipeListener) Close() error              { return nil }
+func (l *pipeListener) Addr() net.Addr            { return l.addr }
+
+// The relay decides whether it can half-close by type-asserting the connection
+// it was handed, so the wrapper has to answer for the transport underneath it
+// rather than for itself: claiming CloseWrite on a transport without one would
+// swallow the EOF, and hiding a real one would truncate the reply still coming
+// back the other way.
+func TestTrackingListenerPreservesCloseWriteExactly(t *testing.T) {
+	t.Parallel()
+
+	type closeWriter interface{ CloseWrite() error }
+
+	raw, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listening: %v", err)
+	}
+	tl := newTrackingListener(raw)
+	defer tl.closeSessions()
+
+	client, err := net.Dial("tcp", raw.Addr().String())
+	if err != nil {
+		t.Fatalf("dialling: %v", err)
+	}
+	defer client.Close()
+
+	server, err := tl.Accept()
+	if err != nil {
+		t.Fatalf("Accept: %v", err)
+	}
+	cw, ok := server.(closeWriter)
+	if !ok {
+		t.Fatalf("a tracked TCP conn (%T) lost CloseWrite", server)
+	}
+	if err := cw.CloseWrite(); err != nil {
+		t.Errorf("CloseWrite on a tracked TCP conn: %v", err)
+	}
+
+	local, remote := net.Pipe()
+	defer local.Close()
+	defer remote.Close()
+	pl := newTrackingListener(&pipeListener{conns: make(chan net.Conn, 1), addr: raw.Addr()})
+	pl.Listener.(*pipeListener).conns <- local
+	piped, err := pl.Accept()
+	if err != nil {
+		t.Fatalf("Accept: %v", err)
+	}
+	if _, ok := piped.(closeWriter); ok {
+		t.Errorf("a tracked pipe conn (%T) gained a CloseWrite its transport does not have", piped)
+	}
+}
+
+// A tracked connection must leave the table when the relay closes it, or the
+// set of live sessions grows for the lifetime of the process.
+func TestTrackingListenerForgetsClosedSessions(t *testing.T) {
+	t.Parallel()
+
+	raw, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listening: %v", err)
+	}
+	tl := newTrackingListener(raw)
+	defer tl.closeSessions()
+
+	for i := 0; i < 3; i++ {
+		client, err := net.Dial("tcp", raw.Addr().String())
+		if err != nil {
+			t.Fatalf("dialling: %v", err)
+		}
+		server, err := tl.Accept()
+		if err != nil {
+			t.Fatalf("Accept: %v", err)
+		}
+		server.Close()
+		client.Close()
+	}
+
+	tl.mu.Lock()
+	live := len(tl.conns)
+	tl.mu.Unlock()
+	if live != 0 {
+		t.Errorf("%d closed sessions are still tracked, want 0", live)
 	}
 }

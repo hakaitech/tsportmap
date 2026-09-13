@@ -356,6 +356,20 @@ func TestFromEnvErrors(t *testing.T) {
 		},
 		want: []string{"TSPM_OUT_a", "TSPM_OUT_b", "127.0.0.1:5432"},
 	}, {
+		name: "two out mappings spelled identically",
+		environ: []string{
+			"TSPM_OUT_a=tcp,0.0.0.0:8080,one:8080",
+			"TSPM_OUT_b=tcp,0.0.0.0:8080,two:8080",
+		},
+		want: []string{"TSPM_OUT_a", "TSPM_OUT_b", "0.0.0.0:8080", `"out"`},
+	}, {
+		name: "two in mappings spelled identically",
+		environ: []string{
+			"TSPM_IN_a=tcp,:8080,127.0.0.1:8080",
+			"TSPM_IN_b=tcp,:8080,127.0.0.1:8081",
+		},
+		want: []string{"TSPM_IN_a", "TSPM_IN_b", ":8080", `"in"`},
+	}, {
 		name: "duplicate listen written two ways",
 		environ: []string{
 			"TSPM_OUT_a=tcp,[::1]:5432,one:5432",
@@ -466,10 +480,25 @@ func TestFromEnvAcceptsNonConflictingBinds(t *testing.T) {
 			"TSPM_OUT_b=tcp,192.168.1.5:8080,two:80",
 		},
 	}, {
-		name: "wildcards in opposite directions bind different stacks",
+		// An ingress listener is opened inside tsnet's netstack and never
+		// creates a socket on the host, so it cannot take a port away from an
+		// egress listener however the two are spelled.
+		name: "wildcards in opposite directions",
 		environ: []string{
 			"TSPM_IN_web=tcp,:8080,127.0.0.1:8080",
 			"TSPM_OUT_api=tcp,0.0.0.0:8080,api:8080",
+		},
+	}, {
+		name: "in and out spelled identically",
+		environ: []string{
+			"TSPM_IN_web=tcp,0.0.0.0:8080,127.0.0.1:9000",
+			"TSPM_OUT_api=tcp,0.0.0.0:8080,api:8080",
+		},
+	}, {
+		name: "in and out spelled identically on a concrete address",
+		environ: []string{
+			"TSPM_IN_web=tcp,100.64.0.1:8080,127.0.0.1:9000",
+			"TSPM_OUT_api=tcp,100.64.0.1:8080,api:8080",
 		},
 	}, {
 		name: "same target reached by two mappings",

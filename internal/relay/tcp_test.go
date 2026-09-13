@@ -898,3 +898,180 @@ func TestHalfCloseWriteReportsUnsupportedTransport(t *testing.T) {
 		})
 	}
 }
+
+// nilAddrConn is a conn that reports no peer address, which is what
+// *gonet.TCPConn — the conn type tsnet hands an ingress listener — does once
+// its gVisor endpoint has moved to an error or closed state. A tailnet peer
+// that connects and immediately resets lands in exactly that window, so the
+// relay sees a live conn whose RemoteAddr is nil.
+type nilAddrConn struct {
+	net.Conn
+}
+
+func (nilAddrConn) RemoteAddr() net.Addr { return nil }
+
+// serveScripted runs ServeTCP over ln and returns a function that closes ln and
+// waits for the loop to exit, so a test can assert the relay ended cleanly.
+func serveScripted(t *testing.T, ln *scriptedListener, dial DialFunc, opts Options) func() {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- ServeTCP(ctx, ln, dial, opts) }()
+	return func() {
+		t.Helper()
+		ln.Close()
+		select {
+		case err := <-errCh:
+			if err != nil {
+				t.Errorf("ServeTCP returned %v, want nil", err)
+			}
+		case <-time.After(waitTimeout):
+			t.Error("ServeTCP did not return")
+		}
+		cancel()
+	}
+}
+
+// TestServeTCPNilRemoteAddr covers a source the transport cannot name. Reading
+// it used to panic the whole process on the per-session goroutine; it must now
+// be refused, with or without an allow list configured, because an address that
+// cannot be identified is not one an empty allow list was ever meant to admit.
+func TestServeTCPNilRemoteAddr(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		allow []string
+	}{
+		{name: "with allow list", allow: []string{"127.0.0.0/8"}},
+		{name: "without allow list"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var allow []netip.Prefix
+			for _, p := range tc.allow {
+				allow = append(allow, mustPrefix(t, p))
+			}
+
+			var mu sync.Mutex
+			var dialled int
+			dial := func(context.Context, string, string) (net.Conn, error) {
+				mu.Lock()
+				dialled++
+				mu.Unlock()
+				return nil, errors.New("must not be dialled")
+			}
+
+			client, served := net.Pipe()
+			defer client.Close()
+			ln := newScriptedListener(acceptStep{conn: nilAddrConn{served}})
+			rec := &testRecorder{}
+			stop := serveScripted(t, ln, dial, Options{Name: "ingress", Target: "192.0.2.1:9", Allow: allow, Metrics: rec})
+			defer stop()
+
+			waitFor(t, "rejection", func() bool {
+				_, _, _, rejected := rec.snapshot()
+				return len(rejected) == 1
+			})
+			opened, _, _, rejected := rec.snapshot()
+			if rejected[0] != ReasonAllowList {
+				t.Fatalf("Rejected reason = %q, want %q", rejected[0], ReasonAllowList)
+			}
+			if opened != 0 {
+				t.Fatalf("SessionOpened called %d times for an unidentifiable source", opened)
+			}
+
+			// The refused conn must be closed, not leaked.
+			client.SetReadDeadline(time.Now().Add(waitTimeout))
+			if _, err := client.Read(make([]byte, 1)); err == nil {
+				t.Fatal("read succeeded, want the refused connection to be closed")
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+			if dialled != 0 {
+				t.Fatalf("dialled %d times for an unidentifiable source, want 0", dialled)
+			}
+		})
+	}
+}
+
+// TestAllowedNilAddr pins the decision down at its source: Allowed answers for
+// a nil address instead of dereferencing it, and answers "no" whether or not a
+// prefix list is configured.
+func TestAllowedNilAddr(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		prefixes []netip.Prefix
+	}{
+		{name: "no allow list"},
+		{name: "allow list", prefixes: []netip.Prefix{mustPrefix(t, "0.0.0.0/0")}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if Allowed(tc.prefixes, nil) {
+				t.Fatal("Allowed(nil addr) = true, want false")
+			}
+		})
+	}
+}
+
+// TestServeTCPSessionPanicDoesNotKillRelay exercises the recover on the session
+// goroutine: a panic in one session is contained, and the listener goes on
+// serving the next one instead of the process dying with every mapping in it.
+func TestServeTCPSessionPanicDoesNotKillRelay(t *testing.T) {
+	t.Parallel()
+
+	poisonedClient, poisonedServed := net.Pipe()
+	defer poisonedClient.Close()
+	healthyClient, healthyServed := net.Pipe()
+	defer healthyClient.Close()
+
+	ln := newScriptedListener(
+		acceptStep{conn: poisonedServed},
+		acceptStep{conn: healthyServed},
+	)
+
+	var mu sync.Mutex
+	var calls int
+	dial := func(context.Context, string, string) (net.Conn, error) {
+		mu.Lock()
+		calls++
+		first := calls == 1
+		mu.Unlock()
+		if first {
+			panic("scripted session panic")
+		}
+		// The onward leg for the healthy session: closed immediately, so the
+		// session completes on its own and is accounted for.
+		a, b := net.Pipe()
+		b.Close()
+		return a, nil
+	}
+
+	rec := &testRecorder{}
+	stop := serveScripted(t, ln, dial, Options{Name: "poisoned", Target: "192.0.2.1:9", Metrics: rec})
+	defer stop()
+
+	// The panicking session's conn is closed by the recover, not leaked.
+	poisonedClient.SetReadDeadline(time.Now().Add(waitTimeout))
+	if _, err := poisonedClient.Read(make([]byte, 1)); err == nil {
+		t.Fatal("read succeeded, want the panicking session's connection to be closed")
+	}
+
+	// The relay survived: a later session on the same listener is still served.
+	waitFor(t, "session after a panic", func() bool { return rec.closedCount() == 1 })
+	opened, closed, _, _ := rec.snapshot()
+	if opened != 1 {
+		t.Fatalf("SessionOpened called %d times, want 1", opened)
+	}
+	if closed[0].name != "poisoned" {
+		t.Fatalf("SessionClosed name = %q, want %q", closed[0].name, "poisoned")
+	}
+}

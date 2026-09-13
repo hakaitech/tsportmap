@@ -32,12 +32,14 @@ const (
 	// wrong, not that something is busy.
 	udpMaxSessions = 4096
 
-	// udpMaxPending caps the datagrams held for a client whose onward dial has
-	// not finished. The dial runs off the read loop so that one slow or hanging
-	// target cannot stall every other client; this bound stops the resulting
-	// queue from becoming an unbounded buffer for a client that sends faster
-	// than its target can be reached. Overflow is dropped, which is the same
-	// loss a UDP sender must already tolerate from the network.
+	// udpMaxPending is the depth of one session's egress queue: the client
+	// datagrams held while that session's writer is still dialling, or is
+	// parked inside a write the target is not draining. Neither the dial nor
+	// the write may happen on the read loop, and this queue is what decouples
+	// them from it. It is bounded because a client that sends faster than its
+	// target accepts must not grow a buffer without limit. Overflow is dropped,
+	// which is the same loss a UDP sender must already tolerate from the
+	// network.
 	udpMaxPending = 8
 
 	// udpFallbackIdle applies when Options.Idle is zero. For TCP zero
@@ -160,6 +162,14 @@ func serveUDP(ctx context.Context, pc net.PacketConn, dial DialFunc, opts Option
 
 // udpReadLoop owns pc's read side. It is the only goroutine that admits
 // sessions, which is why admission needs no coordination beyond the table lock.
+//
+// The invariant this loop is built on: it blocks on nothing but pc.ReadFrom.
+// Everything that can wait on a peer — the onward dial, the onward write — is
+// handed to a session goroutine, every lock it takes is held only across
+// bookkeeping, and every queue it pushes to is bounded and pushed to without
+// blocking. One unresponsive target must cost its own client datagrams and
+// nobody else's, because this loop is the only reader every session on the
+// mapping shares.
 func udpReadLoop(ctx context.Context, pc net.PacketConn, dial DialFunc, opts Options, rec udpMetrics, tbl *udpTable, log *slog.Logger, wg *sync.WaitGroup) error {
 	for {
 		bp := udpBufPool.Get().(*[]byte)
@@ -183,7 +193,7 @@ func udpReadLoop(ctx context.Context, pc net.PacketConn, dial DialFunc, opts Opt
 		if s != nil {
 			// A zero-length datagram is legal and meaningful to some protocols,
 			// so it is relayed like any other.
-			s.send((*bp)[:n], log)
+			s.send((*bp)[:n], rec, opts.Name, log)
 		}
 		udpBufPool.Put(bp)
 	}
@@ -198,18 +208,27 @@ func udpAdmit(ctx context.Context, addr net.Addr, dial DialFunc, opts Options, r
 	// and re-parsing the address per datagram would put a parse on the hot path.
 	if !Allowed(opts.Allow, addr) {
 		rec.rejected(opts.Name, ReasonAllowList)
-		log.Warn("udp datagram from disallowed source", "client", addr.String())
+		// Debug, not Warn: this runs on the read loop, once per rejected
+		// datagram, and the record carries a source address the sender chose.
+		// A flood would otherwise spend the mapping's read budget formatting
+		// log lines about the flood, taking datagrams away from the clients
+		// that are allowed. The rejected counter is the signal to alert on; the
+		// line is only there for someone already debugging one allow list.
+		log.Debug("udp datagram from disallowed source", "client", addr.String())
 		return nil
 	}
 
-	s := &udpSession{key: addr.String(), client: addr, started: time.Now()}
-	s.touch()
+	s := newUDPSession(addr)
 	if !tbl.add(s) {
 		// An established session is never evicted to make room: the sources
 		// already being served did nothing wrong, and a flood of new addresses
 		// would otherwise let an attacker displace legitimate traffic.
 		rec.rejected(opts.Name, ReasonSessionCap)
-		log.Warn("udp session table full, dropping datagram", "client", s.key, "max", tbl.max)
+		// Debug for the same reason as the allow-list rejection above: the
+		// table fills when new source addresses arrive faster than sessions
+		// retire, which is exactly when per-datagram logging is least
+		// affordable.
+		log.Debug("udp session table full, dropping datagram", "client", s.key, "max", tbl.max)
 		return nil
 	}
 
@@ -254,11 +273,52 @@ func udpDialOnward(ctx context.Context, s *udpSession, dial DialFunc, opts Optio
 
 	// Safe to Add while Wait may be running: this goroutine is itself counted,
 	// so the counter cannot be at zero here.
-	wg.Add(1)
+	//
+	// The writer starts only now, after activate has installed conn, so it can
+	// take conn as an argument and never look at s.conn. Whatever queued during
+	// the dial is already in s.egress and is drained first, which is what keeps
+	// the pre-dial and post-dial datagrams in one order.
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		udpWriteLoop(s, conn, log)
+	}()
 	go func() {
 		defer wg.Done()
 		udpReplyLoop(s, conn, pc, rec, opts, tbl, log)
 	}()
+}
+
+// udpWriteLoop is the only goroutine that writes to a session's onward conn,
+// and the reason send does no I/O.
+//
+// A write to the onward leg can park for an unbounded time: tsnet's conns come
+// from a gVisor stack, where a full send buffer parks the writer on the
+// endpoint's writability signal, and nothing in this relay sets a write
+// deadline that would cut it short. On the read loop that stall would freeze
+// every session on the mapping; on this goroutine it costs one client, which is
+// the client whose target stopped reading.
+//
+// Draining a single FIFO queue is also what preserves order: datagrams reach
+// the target in the order the read loop took them off the wire, including
+// across the moment the dial completed.
+func udpWriteLoop(s *udpSession, conn net.Conn, log *slog.Logger) {
+	// The range ends when close closes s.egress, so teardown retires this
+	// goroutine even while the write below is parked: close also closes conn,
+	// which is what makes the parked write return.
+	for b := range s.egress {
+		n, err := conn.Write(b)
+		if err != nil {
+			// A datagram write failure is per-datagram, not per-session: a
+			// connected UDP socket reports a refused port here and on the next
+			// read alike, and the reply loop is the one that decides the session
+			// is finished. Tearing down from the write side as well would just
+			// race with it.
+			log.Debug("udp onward write failed", "client", s.key, "error", err)
+			continue
+		}
+		s.up.Add(int64(n))
+	}
 }
 
 // udpReplyLoop carries the target's datagrams back to the one client address
@@ -316,15 +376,34 @@ type udpSession struct {
 	up       atomic.Int64
 	down     atomic.Int64
 
-	// mu guards the onward conn and the queue of datagrams waiting for it. It is
-	// what makes teardown final: closed is set under mu before conn is closed,
-	// so no goroutine can write to a conn that close has already handed to
-	// Close.
-	mu      sync.Mutex
-	conn    net.Conn
-	pending [][]byte
-	opened  bool
-	closed  bool
+	// egress carries datagrams from the read loop to this session's writer
+	// goroutine. It is created with the session and never reassigned, so the
+	// writer ranges over it without holding mu. Its buffer is also the queue
+	// for datagrams that arrive before the dial finishes: one queue for both
+	// phases is what makes ordering across the handover automatic instead of
+	// something a flush has to arrange.
+	egress chan []byte
+
+	// mu guards the onward conn, the closed flag, and sends on egress. It is
+	// what makes teardown final: closed is set under mu before conn is closed
+	// and before egress is closed, so no goroutine can write to a conn that
+	// close has already handed to Close, and no send can race the channel close
+	// into a send-on-closed-channel panic.
+	mu     sync.Mutex
+	conn   net.Conn
+	opened bool
+	closed bool
+}
+
+func newUDPSession(addr net.Addr) *udpSession {
+	s := &udpSession{
+		key:     addr.String(),
+		client:  addr,
+		started: time.Now(),
+		egress:  make(chan []byte, udpMaxPending),
+	}
+	s.touch()
+	return s
 }
 
 func (s *udpSession) touch() { s.lastSeen.Store(time.Now().UnixNano()) }
@@ -333,66 +412,67 @@ func (s *udpSession) idleSince(now time.Time) time.Duration {
 	return now.Sub(time.Unix(0, s.lastSeen.Load()))
 }
 
-// send forwards one client datagram to the target, queueing it if the onward
-// dial has not finished yet. b is only valid for the duration of the call, so
-// anything queued is copied.
-func (s *udpSession) send(b []byte, log *slog.Logger) {
+// send hands one client datagram to this session's writer goroutine. b is only
+// valid for the duration of the call, so what is queued is a copy.
+//
+// send runs on the read loop that every session on the mapping shares, so it
+// does no I/O and never blocks: it holds mu only across a closed check and a
+// non-blocking channel send, neither of which can wait on anything but another
+// holder of mu, and every other holder does bookkeeping only.
+//
+// An overflowing queue drops the datagram rather than waiting for room. Waiting
+// is what turns one target that has stopped reading into a mapping that has
+// stopped relaying, while loss is what a UDP sender already tolerates from the
+// network.
+func (s *udpSession) send(b []byte, rec udpMetrics, name string, log *slog.Logger) {
+	q := make([]byte, len(b))
+	copy(q, b)
+
+	dropped := false
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
+		s.mu.Unlock()
 		return
 	}
 	s.touch()
-
-	if s.conn == nil {
-		if len(s.pending) >= udpMaxPending {
-			log.Debug("udp pending queue full, dropping datagram", "client", s.key)
-			return
-		}
-		q := make([]byte, len(b))
-		copy(q, b)
-		s.pending = append(s.pending, q)
-		return
+	select {
+	case s.egress <- q:
+	default:
+		dropped = true
 	}
+	s.mu.Unlock()
 
-	n, err := s.conn.Write(b)
-	if err != nil {
-		// A datagram write failure is per-datagram, not per-session: a connected
-		// UDP socket reports a refused port here and on the next read alike, and
-		// the reply loop is the one that decides the session is finished. Tearing
-		// down from the write side as well would just race with it.
-		log.Debug("udp onward write failed", "client", s.key, "error", err)
-		return
+	if dropped {
+		// Reported outside the lock: Recorder is supplied by the caller, and
+		// nothing a caller writes should be able to hold up the read loop.
+		//
+		// ReasonQueueFull, not ReasonSessionCap: this client was admitted and
+		// is now losing traffic because its target stopped draining, which is
+		// a different alert from a new client being turned away.
+		rec.rejected(name, ReasonQueueFull)
+		log.Debug("udp egress queue full, dropping datagram", "client", s.key, "queue", cap(s.egress))
 	}
-	s.up.Add(int64(n))
 }
 
-// activate installs the dialled conn and flushes whatever arrived while the
-// dial was in flight. It reports false if the session was already torn down, in
-// which case the caller owns conn.
+// activate installs the dialled conn. It reports false if the session was
+// already torn down, in which case the caller owns conn.
+//
+// Nothing is flushed here: whatever arrived during the dial is sitting in
+// egress, and the writer goroutine the caller starts next drains it in order.
 func (s *udpSession) activate(conn net.Conn) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return false
 	}
-	// Flush under the same lock that admits new datagrams, so a datagram
-	// arriving mid-flush queues behind the backlog instead of overtaking it.
-	for _, q := range s.pending {
-		n, err := conn.Write(q)
-		if err != nil {
-			break
-		}
-		s.up.Add(int64(n))
-	}
-	s.pending = nil
 	s.conn = conn
 	s.opened = true
 	return true
 }
 
 // close tears the session down exactly once. Closing the onward conn is what
-// unblocks the reply loop, which is why nothing waits for that goroutine here.
+// unblocks the reply loop and any write the writer goroutine is parked in,
+// which is why nothing waits for either goroutine here.
 func (s *udpSession) close(rec udpMetrics, name string) {
 	s.mu.Lock()
 	if s.closed {
@@ -400,9 +480,14 @@ func (s *udpSession) close(rec udpMetrics, name string) {
 		return
 	}
 	s.closed = true
+	// Closing egress under the lock that also guards send is the whole reason
+	// send takes the lock: a send in flight holds mu, so it can never be
+	// choosing a channel that this line has already closed. Closing rather than
+	// abandoning the channel is also what retires the writer goroutine, so
+	// serveUDP's WaitGroup can drain.
+	close(s.egress)
 	conn := s.conn
 	s.conn = nil
-	s.pending = nil
 	opened := s.opened
 	s.mu.Unlock()
 

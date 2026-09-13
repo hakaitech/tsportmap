@@ -42,7 +42,15 @@ type Listener interface {
 // network rather than reporting an error.
 type Guard interface {
 	// Check reports whether host — a MagicDNS name, an FQDN, or an IP — is a
-	// tailnet peer or covered by an eligible accepted route. The returned
-	// string explains the decision and is safe to log.
-	Check(ctx context.Context, host string) (ok bool, why string, err error)
+	// tailnet peer or covered by an eligible accepted route.
+	//
+	// approved is the host in the exact spelling the verdict was reached on.
+	// Check matches a normalised host (unbracketed, lower case, no root dot,
+	// IPv4-mapped IPv6 unmapped), and several of those rewrites change how a
+	// dialer resolves the address, so a caller that dials its own spelling
+	// instead of approved can reach a destination that was never authorised.
+	// It is only meaningful when ok is true.
+	//
+	// why explains the decision and is safe to log.
+	Check(ctx context.Context, host string) (ok bool, approved string, why string, err error)
 }

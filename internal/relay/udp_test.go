@@ -763,3 +763,415 @@ func TestUDPTableIdentityOnRemove(t *testing.T) {
 		t.Fatalf("table len = %d, want 1", got)
 	}
 }
+
+// udpGatedConn is an onward conn whose writes park until the gate is released
+// or the conn is closed. It models the state that motivated the writer
+// goroutine: tsnet's conns come from a gVisor stack that parks a write on the
+// endpoint's writability signal when the send buffer is full, and no write
+// deadline ever cuts that short. Close releasing the write is the behaviour a
+// real conn has, and is what teardown relies on.
+type udpGatedConn struct {
+	net.Conn
+	gate    chan struct{}
+	closeCh chan struct{}
+	once    sync.Once
+
+	// entered counts writes that have reached the gate, so a test can wait for
+	// the session to be genuinely parked rather than sleeping and hoping.
+	entered atomic.Int32
+}
+
+func (c *udpGatedConn) Write(b []byte) (int, error) {
+	c.entered.Add(1)
+	select {
+	case <-c.gate:
+	case <-c.closeCh:
+		return 0, net.ErrClosed
+	}
+	return c.Conn.Write(b)
+}
+
+func (c *udpGatedConn) Close() error {
+	c.once.Do(func() { close(c.closeCh) })
+	return c.Conn.Close()
+}
+
+// udpGateDialer dials the real target but hands the first session a conn whose
+// writes park, so a test can wedge exactly one session's onward write and watch
+// what that costs everyone else.
+type udpGateDialer struct {
+	gate  chan struct{}
+	calls atomic.Int32
+
+	mu    sync.Mutex
+	first *udpGatedConn
+}
+
+func newUDPGateDialer() *udpGateDialer {
+	return &udpGateDialer{gate: make(chan struct{})}
+}
+
+func (d *udpGateDialer) dial(ctx context.Context, network, address string) (net.Conn, error) {
+	var nd net.Dialer
+	c, err := nd.DialContext(ctx, network, address)
+	if err != nil {
+		return nil, err
+	}
+	if d.calls.Add(1) != 1 {
+		return c, nil
+	}
+	g := &udpGatedConn{Conn: c, gate: d.gate, closeCh: make(chan struct{})}
+	d.mu.Lock()
+	d.first = g
+	d.mu.Unlock()
+	return g, nil
+}
+
+func (d *udpGateDialer) release() { close(d.gate) }
+
+// wedged waits until the first session's onward write is parked in the gate.
+func (d *udpGateDialer) wedged(t *testing.T) *udpGatedConn {
+	t.Helper()
+	var g *udpGatedConn
+	udpWaitFor(t, "onward write to park", func() bool {
+		d.mu.Lock()
+		g = d.first
+		d.mu.Unlock()
+		return g != nil && g.entered.Load() > 0
+	})
+	return g
+}
+
+// TestServeUDPParkedWriteDoesNotBlockOtherClients is the property the per-
+// session writer goroutine exists for. A dial that is slow is not enough to
+// prove it: the queue that covers the dial drains on the first write, and it is
+// the writes afterwards that used to run inline on the read loop.
+func TestServeUDPParkedWriteDoesNotBlockOtherClients(t *testing.T) {
+	echo := newUDPEchoServer(t, nil)
+	d := newUDPGateDialer()
+	r := startUDPRelay(t, d.dial, Options{
+		Name:   "parkedwrite",
+		Target: echo.addr,
+		Idle:   time.Minute,
+	}, udpMaxSessions)
+
+	stuck := udpDialClient(t, r.addr)
+	udpSend(t, stuck, []byte("stuck-1"))
+	d.wedged(t)
+
+	// Post-dial datagrams for the wedged session: these are the ones that used
+	// to be written inline, on the read loop, under the session lock.
+	for i := range 3 {
+		udpSend(t, stuck, fmt.Appendf(nil, "stuck-%d", i+2))
+	}
+
+	other := udpDialClient(t, r.addr)
+	udpSend(t, other, []byte("other"))
+	if got := udpRecv(t, other); !bytes.Equal(got, []byte("other")) {
+		t.Fatalf("second client reply = %q, want %q: one parked write must not stall the mapping", got, "other")
+	}
+
+	// Releasing the target delivers what was queued for the wedged client.
+	d.release()
+	if got := udpRecv(t, stuck); !bytes.Equal(got, []byte("stuck-1")) {
+		t.Fatalf("wedged client reply = %q, want %q", got, "stuck-1")
+	}
+}
+
+// TestServeUDPIdleReaperEvictsDuringParkedWrite pins that a stuck write cannot
+// take the reaper with it. The reaper serves every session on the mapping, so a
+// session it cannot close is a session table that stops shrinking.
+func TestServeUDPIdleReaperEvictsDuringParkedWrite(t *testing.T) {
+	echo := newUDPEchoServer(t, nil)
+	rec := &udpFakeRecorder{}
+	d := newUDPGateDialer()
+	r := startUDPRelay(t, d.dial, Options{
+		Name:    "reapparked",
+		Target:  echo.addr,
+		Idle:    80 * time.Millisecond,
+		Metrics: rec,
+	}, udpMaxSessions)
+
+	c := udpDialClient(t, r.addr)
+	udpSend(t, c, []byte("wedge"))
+	g := d.wedged(t)
+
+	select {
+	case <-g.closeCh:
+	case <-time.After(udpTestWait):
+		t.Fatal("idle session was never evicted while its onward write was parked")
+	}
+	udpWaitFor(t, "evicted session accounted closed", func() bool { _, cl := rec.counts(); return cl == 1 })
+}
+
+// TestServeUDPCancellationReturnsDuringParkedWrite pins that shutdown does not
+// wait on the target. serveUDP returning is what the supervisor's grace windows
+// are measured against; a session parked in a write must be torn down by
+// closing its conn, not waited out.
+func TestServeUDPCancellationReturnsDuringParkedWrite(t *testing.T) {
+	echo := newUDPEchoServer(t, nil)
+	rec := &udpFakeRecorder{}
+	d := newUDPGateDialer()
+	r := startUDPRelay(t, d.dial, Options{
+		Name:    "cancelparked",
+		Target:  echo.addr,
+		Idle:    time.Minute,
+		Metrics: rec,
+	}, udpMaxSessions)
+
+	c := udpDialClient(t, r.addr)
+	udpSend(t, c, []byte("wedge"))
+	g := d.wedged(t)
+
+	r.cancel()
+	if err := r.wait(t); err != nil {
+		t.Fatalf("serveUDP = %v, want nil on cancellation", err)
+	}
+	select {
+	case <-g.closeCh:
+	default:
+		t.Fatal("onward conn still open after serveUDP returned")
+	}
+	if o, cl := rec.counts(); o != 1 || cl != 1 {
+		t.Fatalf("opened=%d closed=%d, want 1/1", o, cl)
+	}
+}
+
+// TestServeUDPPreservesOrderAcrossDial pins that the queue covering the dial and
+// the queue feeding the writer are one queue. Two queues handed over at
+// activation would be free to let a datagram that arrived after the dial
+// finished overtake the backlog that arrived before it.
+func TestServeUDPPreservesOrderAcrossDial(t *testing.T) {
+	echo := newUDPEchoServer(t, nil)
+	gate := make(chan struct{})
+	d := &udpTrackedDialer{gate: gate}
+	r := startUDPRelay(t, d.dial, Options{
+		Name:   "ordering",
+		Target: echo.addr,
+		Idle:   time.Minute,
+	}, udpMaxSessions)
+
+	// Half the datagrams are sent while the dial is stalled and half while it
+	// is completing, and the total stays inside the queue bound so that the
+	// only thing under test is order, not loss.
+	const half = udpMaxPending / 2
+	c := udpDialClient(t, r.addr)
+	sent := make([][]byte, 0, 2*half)
+	for i := range half {
+		b := fmt.Appendf(nil, "pre-%d", i)
+		sent = append(sent, b)
+		udpSend(t, c, b)
+	}
+	udpWaitFor(t, "dial to start", func() bool { return d.calls.Load() == 1 })
+
+	close(gate)
+	for i := range half {
+		b := fmt.Appendf(nil, "post-%d", i)
+		sent = append(sent, b)
+		udpSend(t, c, b)
+	}
+
+	for i, want := range sent {
+		if got := udpRecv(t, c); !bytes.Equal(got, want) {
+			t.Fatalf("datagram %d = %q, want %q: order was not preserved", i, got, want)
+		}
+	}
+}
+
+// TestServeUDPEgressQueueDropsWhenFull pins the bound on the queue. A client
+// whose target has stopped reading loses its own datagrams, which is the loss
+// UDP already has; what it must not do is take the read loop with it.
+func TestServeUDPEgressQueueDropsWhenFull(t *testing.T) {
+	udpQuietLogs(t)
+	echo := newUDPEchoServer(t, nil)
+	rec := &udpFakeRecorder{}
+	d := newUDPGateDialer()
+	r := startUDPRelay(t, d.dial, Options{
+		Name:    "egresscap",
+		Target:  echo.addr,
+		Idle:    time.Minute,
+		Metrics: rec,
+	}, udpMaxSessions)
+
+	stuck := udpDialClient(t, r.addr)
+	udpSend(t, stuck, []byte("wedge"))
+	d.wedged(t)
+
+	// Far more than the queue holds, so the overflow is not a matter of timing.
+	for i := range 10 * udpMaxPending {
+		udpSend(t, stuck, fmt.Appendf(nil, "flood-%d", i))
+	}
+
+	udpWaitFor(t, "a dropped datagram to be recorded", func() bool { return len(rec.rejected()) > 0 })
+	for i, got := range rec.rejected() {
+		if got != ReasonQueueFull {
+			t.Fatalf("rejection %d = %q, want %q", i, got, ReasonQueueFull)
+		}
+	}
+
+	// The flood was absorbed by dropping, not by blocking: the read loop is
+	// still serving everyone else.
+	other := udpDialClient(t, r.addr)
+	udpSend(t, other, []byte("other"))
+	if got := udpRecv(t, other); !bytes.Equal(got, []byte("other")) {
+		t.Fatalf("second client reply = %q, want %q", got, "other")
+	}
+}
+
+// TestUDPSessionSendCloseRace covers the hazard the session lock now exists to
+// prevent: a send that picks the egress channel while close is closing it would
+// panic and take the whole process down, and the read loop calls send for every
+// datagram of every session while the reaper closes sessions underneath it.
+func TestUDPSessionSendCloseRace(t *testing.T) {
+	udpQuietLogs(t)
+	log := slog.Default()
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9999}
+
+	for range 40 {
+		s := newUDPSession(addr)
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for range 4 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				for range 32 {
+					s.send([]byte("datagram"), udpMetrics{}, "race", log)
+				}
+			}()
+		}
+		// Two closers, because close must be idempotent as well as safe: the
+		// reaper and teardown can both reach the same session.
+		for range 2 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				s.close(udpMetrics{}, "race")
+			}()
+		}
+		close(start)
+		wg.Wait()
+
+		// A send after close is a no-op, not a panic.
+		s.send([]byte("late"), udpMetrics{}, "race", log)
+		s.close(udpMetrics{}, "race")
+	}
+}
+
+// udpLevelHandler records the level of every log record the relay emits.
+type udpLevelHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *udpLevelHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *udpLevelHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, r.Clone())
+	return nil
+}
+
+func (h *udpLevelHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *udpLevelHandler) WithGroup(string) slog.Handler      { return h }
+
+func (h *udpLevelHandler) above(level slog.Level) []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []string
+	for _, r := range h.records {
+		if r.Level >= level {
+			out = append(out, r.Message)
+		}
+	}
+	return out
+}
+
+func (h *udpLevelHandler) has(level slog.Level, msg string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, r := range h.records {
+		if r.Level == level && r.Message == msg {
+			return true
+		}
+	}
+	return false
+}
+
+func udpCaptureLogs(t *testing.T) *udpLevelHandler {
+	t.Helper()
+	h := &udpLevelHandler{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(h))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return h
+}
+
+// TestServeUDPAdmissionRejectionsAreNotWarnings pins the log level of the two
+// admission rejections. Both are decided on the read loop, once per datagram,
+// with an attribute the sender chose; at Warn a flood spends the mapping's read
+// budget on formatting log lines about itself, which costs the clients that are
+// allowed the datagrams that were dropped writing about the ones that were not.
+// The rejected counter is what an operator alerts on.
+func TestServeUDPAdmissionRejectionsAreNotWarnings(t *testing.T) {
+	tests := []struct {
+		name        string
+		allow       []string
+		maxSessions int
+		wantMsg     string
+		wantReason  string
+	}{
+		{
+			name:        "disallowed source",
+			allow:       []string{"10.0.0.0/8"},
+			maxSessions: udpMaxSessions,
+			wantMsg:     "udp datagram from disallowed source",
+			wantReason:  ReasonAllowList,
+		},
+		{
+			name:        "session table full",
+			maxSessions: 1,
+			wantMsg:     "udp session table full, dropping datagram",
+			wantReason:  ReasonSessionCap,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			echo := newUDPEchoServer(t, nil)
+			rec := &udpFakeRecorder{}
+			h := udpCaptureLogs(t)
+			r := startUDPRelay(t, (&udpTrackedDialer{}).dial, Options{
+				Name:    "logs",
+				Target:  echo.addr,
+				Idle:    time.Minute,
+				Allow:   udpPrefixes(t, tt.allow...),
+				Metrics: rec,
+			}, tt.maxSessions)
+
+			if tt.maxSessions == 1 {
+				// Fill the one slot with a session that is allowed to stay.
+				first := udpDialClient(t, r.addr)
+				udpSend(t, first, []byte("first"))
+				udpRecv(t, first)
+			}
+
+			c := udpDialClient(t, r.addr)
+			for range 3 {
+				udpSend(t, c, []byte("knock"))
+			}
+			// Waiting on the log record rather than on the counter: the
+			// counter is incremented first, so observing it says nothing about
+			// whether the line has been emitted yet.
+			udpWaitFor(t, "rejection logged", func() bool { return h.has(slog.LevelDebug, tt.wantMsg) })
+			if got := rec.rejected(); len(got) == 0 || got[0] != tt.wantReason {
+				t.Fatalf("rejections = %v, want %q", got, tt.wantReason)
+			}
+			if got := h.above(slog.LevelWarn); len(got) != 0 {
+				t.Fatalf("logged %v at Warn or above; a rejected datagram must not raise the log level", got)
+			}
+		})
+	}
+}

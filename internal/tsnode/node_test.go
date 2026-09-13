@@ -221,15 +221,23 @@ func TestRunningBeforeStart(t *testing.T) {
 }
 
 type fakeGuard struct {
-	ok   bool
-	why  string
-	err  error
-	last string
+	ok bool
+	// approved is the host the guard claims to have authorised. It defaults to
+	// the host it was asked about, so a test only sets it when the point is
+	// that the guard normalised the host before deciding.
+	approved string
+	why      string
+	err      error
+	last     string
 }
 
-func (f *fakeGuard) Check(_ context.Context, host string) (bool, string, error) {
+func (f *fakeGuard) Check(_ context.Context, host string) (bool, string, string, error) {
 	f.last = host
-	return f.ok, f.why, f.err
+	approved := f.approved
+	if approved == "" {
+		approved = host
+	}
+	return f.ok, approved, f.why, f.err
 }
 
 func TestDialContextGuard(t *testing.T) {
@@ -306,6 +314,75 @@ func TestDialContextGuard(t *testing.T) {
 				t.Errorf("guard saw host %q, want %q", tt.guard.last, tt.wantHost)
 			}
 		})
+	}
+}
+
+// TestDialContextDialsTheApprovedHost pins the invariant that closes a guard
+// bypass: the string the guard authorised is the string that gets dialled.
+//
+// The guard approves ::ffff:10.1.2.3 by unmapping it to 10.1.2.3 and matching
+// that against an accepted subnet route. tsnet does no unmapping, and its
+// route lookup for the mapped spelling misses where the unmapped one hits, so
+// dialling the caller's spelling handed tsdial an address it could not place
+// on the tailnet - and a lookup miss is exactly what makes it fall through to
+// a plain dial on the container's own network.
+func TestDialContextDialsTheApprovedHost(t *testing.T) {
+	router := testPeer(t, "router.example-tailnet.ts.net.", true, addrs(t, "100.64.0.21"), prefixes(t, "10.1.2.0/24"))
+	st := statusOf(t, nil, router)
+
+	n, err := New(baseConfig(), quietLogger())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	n.guard = newGuard(fakeState{st: st, prefs: &ipn.Prefs{RouteAll: true}}, quietLogger())
+
+	got, err := n.authorisedAddress(context.Background(), "[::ffff:10.1.2.3]:5432")
+	if err != nil {
+		t.Fatalf("authorisedAddress() error = %v; the guard accepts this destination", err)
+	}
+	if got != "10.1.2.3:5432" {
+		t.Errorf("dial address = %q, want %q: an approved destination must be dialled in the form it was approved in", got, "10.1.2.3:5432")
+	}
+}
+
+// TestAuthorisedAddressUsesTheGuardsAnswer keeps the node from substituting its
+// own idea of a host for the guard's: whatever form the guard reports is the
+// form that must be dialled, including the port it was split from.
+func TestAuthorisedAddressUsesTheGuardsAnswer(t *testing.T) {
+	n, err := New(baseConfig(), quietLogger())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	g := &fakeGuard{ok: true, approved: "db.example-tailnet.ts.net", why: "peer"}
+	n.guard = g
+
+	got, err := n.authorisedAddress(context.Background(), "DB.Example-Tailnet.TS.NET.:5432")
+	if err != nil {
+		t.Fatalf("authorisedAddress() error = %v", err)
+	}
+	if got != "db.example-tailnet.ts.net:5432" {
+		t.Errorf("dial address = %q, want the guard's approved host with the original port", got)
+	}
+	if g.last != "DB.Example-Tailnet.TS.NET." {
+		t.Errorf("guard saw host %q, want the host exactly as the caller wrote it", g.last)
+	}
+}
+
+// TestAuthorisedAddressWithoutGuard bounds the invariant: with the guard off
+// nothing is authorised, so nothing may be rewritten either.
+func TestAuthorisedAddressWithoutGuard(t *testing.T) {
+	n, err := New(baseConfig(), quietLogger())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	n.cfg.RequireTailnetDest = false
+
+	got, err := n.authorisedAddress(context.Background(), "[::ffff:10.1.2.3]:5432")
+	if err != nil {
+		t.Fatalf("authorisedAddress() error = %v", err)
+	}
+	if got != "[::ffff:10.1.2.3]:5432" {
+		t.Errorf("dial address = %q, want the caller's address unchanged", got)
 	}
 }
 
@@ -580,6 +657,107 @@ func TestUnrecoverableAuthState(t *testing.T) {
 			want: true,
 		},
 		{
+			// health.LoginStateWarnable wraps EVERY TryLogin failure in this
+			// same sentence, so the prefix says nothing about the credential.
+			// controlclient backs off and retries after each of the four cases
+			// below, and a node with no stored key would otherwise abort about
+			// a second into a control-plane blip and crash-loop.
+			name: "dns lookup timed out reaching control",
+			st: &ipnstate.Status{
+				BackendState: ipn.NeedsLogin.String(),
+				Health: []string{`You are logged out. The last login error was: register request: Post ` +
+					`"https://controlplane.tailscale.com/machine/register": dial tcp: lookup controlplane.tailscale.com ` +
+					`on 127.0.0.11:53: read udp 172.17.0.2:52890->127.0.0.11:53: i/o timeout`},
+			},
+			want: false,
+		},
+		{
+			name: "control returned http 503",
+			st: &ipnstate.Status{
+				BackendState: ipn.NeedsLogin.String(),
+				Health:       []string{"You are logged out. The last login error was: register request: http 503: Service Unavailable"},
+			},
+			want: false,
+		},
+		{
+			name: "registration is rate limited",
+			st: &ipnstate.Status{
+				BackendState: ipn.NeedsLogin.String(),
+				Health:       []string{"You are logged out. The last login error was: node registration rate limited; will retry after 30s"},
+			},
+			want: false,
+		},
+		{
+			name: "the login attempt ran out of time",
+			st: &ipnstate.Status{
+				BackendState: ipn.NeedsLogin.String(),
+				Health: []string{`You are logged out. The last login error was: register request: Post ` +
+					`"https://controlplane.tailscale.com/machine/register": context deadline exceeded`},
+			},
+			want: false,
+		},
+		{
+			// Fetching control's public key happens on the same login path and
+			// its endpoint is "/key", so a transport failure there mentions a
+			// key and a certificate that is "not valid" without control having
+			// judged the credential at all.
+			name: "tls failure fetching the control key",
+			st: &ipnstate.Status{
+				BackendState: ipn.NeedsLogin.String(),
+				Health: []string{`You are logged out. The last login error was: fetch control key: Get ` +
+					`"https://controlplane.tailscale.com/key?v=110": tls: failed to verify certificate: ` +
+					`x509: certificate is not valid for any names`},
+			},
+			want: false,
+		},
+		{
+			name: "logged out with no error recorded yet",
+			st: &ipnstate.Status{
+				BackendState: ipn.NeedsLogin.String(),
+				Health:       []string{"You are logged out."},
+			},
+			want: false,
+		},
+		{
+			name: "single-use key already redeemed",
+			st: &ipnstate.Status{
+				BackendState: ipn.NeedsLogin.String(),
+				Health:       []string{"You are logged out. The last login error was: invalid key: single-use key has already been used"},
+			},
+			want: true,
+		},
+		{
+			name: "key expired",
+			st: &ipnstate.Status{
+				BackendState: ipn.NeedsLogin.String(),
+				Health:       []string{"You are logged out. The last login error was: invalid key: key is expired"},
+			},
+			want: true,
+		},
+		{
+			// Alternative control implementations word this differently, so
+			// the evidence looked for is a credential noun beside a rejection,
+			// not one vendor's sentence.
+			name: "control rejects the authkey outright",
+			st: &ipnstate.Status{
+				BackendState: ipn.NeedsLogin.String(),
+				Health:       []string{"You are logged out. The last login error was: Invalid authkey"},
+			},
+			want: true,
+		},
+		{
+			// A rejection alongside unrelated noise must still be found.
+			name: "rejection beside an unrelated warning",
+			st: &ipnstate.Status{
+				BackendState: ipn.NeedsLogin.String(),
+				Health: []string{
+					"Tailscale is unable to connect to the internet.",
+					"You are logged out. The last login error was: invalid key: API key does not exist",
+				},
+			},
+			want: true,
+		},
+		{
 			// The node passes through NeedsLogin before it has presented its
 			// key. Aborting here would turn a slow start into a failed one.
 			name: "needs login while still starting",
@@ -595,12 +773,15 @@ func TestUnrecoverableAuthState(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "awaiting machine authorisation after a login error",
+			// An operator can approve the device on the admin console inside
+			// the timeout window, so this is not a state to abort on: doing so
+			// would take that chance away.
+			name: "awaiting machine authorisation",
 			st: &ipnstate.Status{
 				BackendState: ipn.NeedsMachineAuth.String(),
-				Health:       []string{"login error: device not approved"},
+				Health:       []string{"You are logged out. The last login error was: device not approved"},
 			},
-			want: true,
+			want: false,
 		},
 		{
 			// Health noise in a healthy state must never abort the wait.

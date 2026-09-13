@@ -70,7 +70,7 @@ services:
       # the "app" container behind it only ever speaks plain HTTP. It needs
       # MagicDNS and HTTPS certificates enabled on the tailnet, and is valid
       # only on an in+tcp mapping.
-      TSPM_IN_APP: tcp,:443,app:8080,tls=true,idle=5m
+      TSPM_IN_APP: tcp,:443,app:80,tls=true,idle=5m
 
       # Bound to 0.0.0.0 so sibling containers can scrape it. /healthz, /readyz
       # and /metrics are unauthenticated, which is why the default is loopback;
@@ -103,9 +103,11 @@ services:
     # HTTP client to run one with. Probe port 9090 /healthz from outside the
     # container instead of writing a check here that cannot execute.
 
-  # Stand-in for whatever this project actually serves. It listens on 8080 and
-  # is reached from the tailnet through the ingress mapping above; it needs no
-  # published port of its own, which is the point.
+  # Stand-in for whatever this project actually serves. The stock nginx image
+  # listens on port 80, which is what the ingress mapping above dials; point
+  # that mapping at whatever port your own service listens on instead. It needs
+  # no published port of its own, which is the point: the only way in is the
+  # tailnet.
   app:
     image: nginx:1.29-alpine
     restart: unless-stopped

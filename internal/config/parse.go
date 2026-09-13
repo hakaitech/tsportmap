@@ -469,7 +469,13 @@ func splitHostPort(varName, field, value string) (host, port string, err error) 
 }
 
 // bind identifies a listening socket for conflict detection.
+//
+// The direction is part of the identity because the two directions do not
+// share an address space: an ingress listener is opened inside tsnet's
+// netstack and never creates a socket on the host, so an "in" and an "out"
+// mapping written identically claim different things and cannot collide.
 type bind struct {
+	dir   Direction
 	proto Proto
 	host  string
 	port  string
@@ -499,10 +505,10 @@ func checkBinds(decls []declared) error {
 		}
 		host = canonicalHost(host)
 
-		key := bind{proto: d.m.Proto, host: host, port: port}
+		key := bind{dir: d.m.Dir, proto: d.m.Proto, host: host, port: port}
 		if other, dup := exact[key]; dup {
-			return fmt.Errorf("%s and %s both listen on %s %s; a mapping's (proto, listen) pair must be unique",
-				other.env, d.env, d.m.Proto, d.m.Listen)
+			return fmt.Errorf("%s and %s are both %q mappings listening on %s %s; a mapping's (direction, proto, listen) triple must be unique",
+				other.env, d.env, d.m.Dir, d.m.Proto, d.m.Listen)
 		}
 		exact[key] = d
 

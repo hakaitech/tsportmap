@@ -55,6 +55,9 @@ const (
 	ReasonNotTailnet = relay.ReasonNotTailnet
 	// ReasonOther is every reason not named here.
 	ReasonOther = relay.ReasonOther
+	// ReasonQueueFull is a datagram dropped because the session's egress queue
+	// was full.
+	ReasonQueueFull = relay.ReasonQueueFull
 	// ReasonRefused is an onward dial actively refused by the target.
 	ReasonRefused = relay.ReasonRefused
 	// ReasonSessionCap is a session refused because a limit was already
@@ -71,6 +74,7 @@ var reasons = [...]string{
 	ReasonDialTimeout,
 	ReasonNotTailnet,
 	ReasonOther,
+	ReasonQueueFull,
 	ReasonRefused,
 	ReasonSessionCap,
 }
@@ -277,10 +281,16 @@ func (r *Registry) WritePrometheus(w io.Writer) error {
 	writeHeader(&b, metricActive, "gauge", "Sessions currently open, by mapping.")
 	for _, m := range all {
 		// Derived rather than tracked separately so the gauge cannot drift
-		// away from the two counters that define it. A negative value would
-		// mean a session was reported closed without being reported open, and
-		// is left visible rather than clamped away.
-		active := m.stats.opened.Load() - m.stats.closed.Load()
+		// away from the two counters that define it.
+		//
+		// closed is loaded first because the pair is not read atomically: a
+		// session that finishes between the two loads would otherwise be
+		// counted in closed but not in opened, publishing a negative gauge
+		// for a scrape that happened to land in that window. Reading closed
+		// first can only understate the closes relative to the opens, so the
+		// worst case is a momentarily stale value that is still >= 0.
+		closed := m.stats.closed.Load()
+		active := m.stats.opened.Load() - closed
 		writeSample(&b, metricActive, mappingLabel(m.name), strconv.FormatInt(active, 10))
 	}
 

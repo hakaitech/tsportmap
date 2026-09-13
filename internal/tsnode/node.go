@@ -298,22 +298,109 @@ func (n *Node) watchAuthRejection(ctx context.Context, lc *local.Client, abort c
 // unrecoverableAuthState reports whether a backend snapshot shows a credential
 // failure that more waiting cannot fix.
 //
-// NeedsLogin alone is not enough: it is also the state a node passes through
-// before its key has been presented. The distinguishing signal is control
-// having answered with a login error, which the backend surfaces in its health
-// messages.
+// The trade-off is deliberately lopsided. A false negative costs only the
+// remainder of UpTimeout, which the operator already agreed to wait. A false
+// positive turns a recoverable control-plane blip into a crash loop: a node
+// with no stored key restarts, hits the same blip, and aborts again about a
+// second in - and when the credential is an OAuth client secret, every one of
+// those restarts mints a fresh API key. So this predicate answers "no"
+// whenever it is not certain.
+//
+// Certainty has to come from the credential-specific part of the health text.
+// The text as a whole cannot carry it: tailscale's health.LoginStateWarnable
+// renders every failed attempt as "You are logged out. The last login error
+// was: %v", and controlclient's auth routine feeds that warnable the error
+// from EVERY TryLogin failure before it backs off and retries - a DNS timeout,
+// an HTTP 503, a rate limit, a deadline exceeded. Matching the fixed part of
+// that sentence therefore matches states the node would have recovered from on
+// its own. Only the %v distinguishes a control plane that refused the
+// credential from a control plane that was never reached.
 func unrecoverableAuthState(st *ipnstate.Status) bool {
 	if st == nil {
 		return false
 	}
-	switch st.BackendState {
-	case ipn.NeedsLogin.String(), ipn.NeedsMachineAuth.String():
-	default:
+	// NeedsMachineAuth is deliberately not a trigger. A device awaiting
+	// approval is waiting on a human, and that human can approve it inside the
+	// timeout window; aborting would take that chance away.
+	if st.BackendState != ipn.NeedsLogin.String() {
 		return false
 	}
 	for _, h := range st.Health {
-		l := strings.ToLower(h)
-		if strings.Contains(l, "login error") || strings.Contains(l, "invalid key") {
+		if credentialRejected(h) {
+			return true
+		}
+	}
+	return false
+}
+
+// credentialNouns and credentialRejections must BOTH appear in one health
+// message before it counts as a refusal. Control reports a refused credential
+// as a bare sentence about the credential itself ("invalid key: API key does
+// not exist", "invalid key: single-use key has already been used"), which no
+// transport failure produces.
+var (
+	credentialNouns = []string{"key", "credential", "secret", "token"}
+
+	credentialRejections = []string{
+		"invalid",
+		"not valid",
+		"expired",
+		"already been used",
+		"already used",
+		"revoked",
+		"does not exist",
+	}
+)
+
+// recoverableEvidence disqualifies a health message outright, before the two
+// lists above are consulted, because it shows the message is reporting on the
+// attempt rather than on the credential.
+//
+// The URL entries do most of the work. Every error raised on the login path
+// before control answers is a wrapped *url.Error and so carries the control
+// URL, while a verdict from control never does. That also defuses the trap in
+// the control URL itself: the endpoint that fetches control's public key is
+// "/key", so a TLS or DNS failure fetching it produces a message containing
+// both "key" and, via "certificate is not valid", a rejection word.
+var recoverableEvidence = []string{
+	"http://",
+	"https://",
+	"timeout",
+	"timed out",
+	"deadline exceeded",
+	"context canceled",
+	"context cancelled",
+	"rate limit",
+	"too many requests",
+	"retry after",
+	"connection refused",
+	"connection reset",
+	"no route to host",
+	"network is unreachable",
+	"no such host",
+	"server misbehaving",
+	"temporary failure",
+	"unexpected eof",
+	"x509",
+	"certificate",
+	"tls ",
+	"http 4",
+	"http 5",
+	"status 4",
+	"status 5",
+}
+
+func credentialRejected(healthMsg string) bool {
+	h := strings.ToLower(healthMsg)
+	if containsAny(h, recoverableEvidence) {
+		return false
+	}
+	return containsAny(h, credentialNouns) && containsAny(h, credentialRejections)
+}
+
+func containsAny(s string, subs []string) bool {
+	for _, sub := range subs {
+		if strings.Contains(s, sub) {
 			return true
 		}
 	}
@@ -392,28 +479,52 @@ func (n *Node) Close() error {
 // DialContext opens a connection to address over the tailnet, refusing any
 // destination the guard cannot place in the tailnet when the guard is enabled.
 func (n *Node) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	if n.cfg.RequireTailnetDest {
-		host, _, err := net.SplitHostPort(address)
-		if err != nil {
-			return nil, fmt.Errorf("tsnode: dial %q: address must be host:port: %w", address, err)
-		}
-		g := n.currentGuard()
-		if g == nil {
-			return nil, fmt.Errorf("tsnode: dial %q: the node is not running, so the destination guard cannot verify the target", address)
-		}
-		ok, why, err := g.Check(ctx, host)
-		if err != nil {
-			// A guard that cannot answer must not be treated as a "yes": the
-			// unverified dial is the one that escapes onto the host network.
-			return nil, fmt.Errorf("tsnode: dial %q: checking destination: %w", address, err)
-		}
-		if !ok {
-			n.log.Error("refusing dial: destination is not on the tailnet", "address", address, "why", why)
-			return nil, fmt.Errorf("%w: %s: %s", ErrNotTailnet, address, why)
-		}
-		n.log.Debug("destination allowed", "address", address, "why", why)
+	dialAddress, err := n.authorisedAddress(ctx, address)
+	if err != nil {
+		return nil, err
 	}
-	return n.srv.Dial(ctx, network, address)
+	// Invariant: the string that was authorised is the string that gets
+	// dialled. The guard matches a normalised host, tsnet's dialer does not
+	// normalise at all, and the two disagree on IPv4-mapped IPv6: a route
+	// lookup for 10.1.2.3 succeeds where the same lookup for ::ffff:10.1.2.3
+	// misses, and a miss is what makes tsdial fall through to a plain dial on
+	// the container's own network. Dialling the caller's original spelling
+	// would therefore let an approved destination become an unapproved one
+	// between the check and the dial.
+	return n.srv.Dial(ctx, network, dialAddress)
+}
+
+// authorisedAddress runs the destination guard over address and returns the
+// address that may be dialled, which is not always the one passed in: the
+// guard reports the host in the exact form it approved, and that form is what
+// the caller must use. When the guard is disabled the address is returned
+// unchanged, because nothing was authorised and so there is nothing to hold
+// the dial to.
+func (n *Node) authorisedAddress(ctx context.Context, address string) (string, error) {
+	if !n.cfg.RequireTailnetDest {
+		return address, nil
+	}
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return "", fmt.Errorf("tsnode: dial %q: address must be host:port: %w", address, err)
+	}
+	g := n.currentGuard()
+	if g == nil {
+		return "", fmt.Errorf("tsnode: dial %q: the node is not running, so the destination guard cannot verify the target", address)
+	}
+	ok, approved, why, err := g.Check(ctx, host)
+	if err != nil {
+		// A guard that cannot answer must not be treated as a "yes": the
+		// unverified dial is the one that escapes onto the host network.
+		return "", fmt.Errorf("tsnode: dial %q: checking destination: %w", address, err)
+	}
+	if !ok {
+		n.log.Error("refusing dial: destination is not on the tailnet", "address", address, "why", why)
+		return "", fmt.Errorf("%w: %s: %s", ErrNotTailnet, address, why)
+	}
+	dialAddress := net.JoinHostPort(approved, port)
+	n.log.Debug("destination allowed", "address", address, "dial_address", dialAddress, "why", why)
+	return dialAddress, nil
 }
 
 func (n *Node) currentGuard() Guard {

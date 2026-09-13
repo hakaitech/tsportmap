@@ -197,7 +197,7 @@ func TestCheckDest(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ok, why := checkDest(tt.st, tt.acceptRoutes, tt.host)
+			ok, approved, why := checkDest(tt.st, tt.acceptRoutes, tt.host)
 			if ok != tt.wantOK {
 				t.Fatalf("checkDest(%q) = %v, want %v (why: %s)", tt.host, ok, tt.wantOK, why)
 			}
@@ -208,6 +208,9 @@ func TestCheckDest(t *testing.T) {
 			}
 			if why == "" {
 				t.Error("why must never be empty: it is the only explanation an operator gets")
+			}
+			if ok && approved == "" {
+				t.Error("an allowed destination must report the host it was allowed as: the caller dials that string, not the one it passed in")
 			}
 		})
 	}
@@ -221,7 +224,7 @@ func TestCheckDestFQDNBeatsShortName(t *testing.T) {
 	b := testPeer(t, "cache.zzz-tailnet.ts.net.", true, addrs(t, "100.64.0.11"), nil)
 	st := statusOf(t, nil, a, b)
 
-	ok, why := checkDest(st, false, "cache.zzz-tailnet.ts.net")
+	ok, _, why := checkDest(st, false, "cache.zzz-tailnet.ts.net")
 	if !ok {
 		t.Fatalf("checkDest refused a known FQDN: %s", why)
 	}
@@ -237,7 +240,7 @@ func TestCheckDestPrefersMostSpecificRoute(t *testing.T) {
 	narrow := testPeer(t, "narrow.example-tailnet.ts.net.", true, addrs(t, "100.64.0.21"), prefixes(t, "10.1.2.0/24"))
 	st := statusOf(t, nil, wide, narrow)
 
-	ok, why := checkDest(st, true, "10.1.2.3")
+	ok, _, why := checkDest(st, true, "10.1.2.3")
 	if !ok {
 		t.Fatalf("checkDest refused an address inside an accepted route: %s", why)
 	}
@@ -253,10 +256,10 @@ func TestCheckDestPrimaryRoutes(t *testing.T) {
 	p.PrimaryRoutes = ptr.To(views.SliceOf(prefixes(t, "172.20.0.0/16")))
 	st := statusOf(t, nil, p)
 
-	if ok, why := checkDest(st, true, "172.20.5.5"); !ok {
+	if ok, _, why := checkDest(st, true, "172.20.5.5"); !ok {
 		t.Errorf("checkDest refused a primary-route destination: %s", why)
 	}
-	if ok, _ := checkDest(st, false, "172.20.5.5"); ok {
+	if ok, _, _ := checkDest(st, false, "172.20.5.5"); ok {
 		t.Error("checkDest allowed a subnet route while accept-routes is off")
 	}
 }
@@ -324,7 +327,7 @@ func TestGuardCheck(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			g := newGuard(tt.state, quiet)
-			ok, why, err := g.Check(context.Background(), tt.host)
+			ok, _, why, err := g.Check(context.Background(), tt.host)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("Check() error = nil, want an error (ok=%v why=%q)", ok, why)
@@ -356,6 +359,52 @@ func TestNormaliseHost(t *testing.T) {
 	for _, tt := range tests {
 		if got := normaliseHost(tt.in); got != tt.want {
 			t.Errorf("normaliseHost(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+// TestCheckDestReportsUnmappedAddress covers the mismatch that made the guard
+// bypassable: it accepts an IPv4-mapped IPv6 destination by matching the IPv4
+// address inside it, so the form it approves has to be that IPv4 address.
+// tsnet's dialer does no unmapping of its own - a route lookup for
+// ::ffff:10.1.2.3 misses where 10.1.2.3 hits - so handing the caller back the
+// mapped spelling would have it dial an address the guard never matched.
+func TestCheckDestReportsUnmappedAddress(t *testing.T) {
+	router := testPeer(t, "router.example-tailnet.ts.net.", true, addrs(t, "100.64.0.21"), prefixes(t, "10.1.2.0/24"))
+	st := statusOf(t, nil, router)
+
+	ok, approved, why := checkDest(st, true, "::ffff:10.1.2.3")
+	if !ok {
+		t.Fatalf("checkDest refused an IPv4-mapped address inside an accepted route: %s", why)
+	}
+	if approved != "10.1.2.3" {
+		t.Errorf("approved = %q, want %q: the approved form must be the one the route was matched against", approved, "10.1.2.3")
+	}
+}
+
+// TestGuardCheckReportsApprovedHost pins the same guarantee at the Guard
+// boundary, which is the only part of it the dialler can see.
+func TestGuardCheckReportsApprovedHost(t *testing.T) {
+	peer := testPeer(t, "DB.Example-Tailnet.TS.NET.", true, addrs(t, "100.64.0.2", "fd7a:115c:a1e0::2"), prefixes(t, "192.168.0.0/24"))
+	st := statusOf(t, nil, peer)
+	g := newGuard(fakeState{st: st, prefs: &ipn.Prefs{RouteAll: true}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	tests := []struct{ host, want string }{
+		{"::ffff:192.168.0.5", "192.168.0.5"},
+		{"::ffff:100.64.0.2", "100.64.0.2"},
+		{"[fd7a:115c:a1e0::2]", "fd7a:115c:a1e0::2"},
+		{"DB.Example-Tailnet.TS.NET.", "db.example-tailnet.ts.net"},
+	}
+	for _, tt := range tests {
+		ok, approved, why, err := g.Check(context.Background(), tt.host)
+		if err != nil {
+			t.Fatalf("Check(%q) error = %v", tt.host, err)
+		}
+		if !ok {
+			t.Fatalf("Check(%q) refused a destination it should allow: %s", tt.host, why)
+		}
+		if approved != tt.want {
+			t.Errorf("Check(%q) approved = %q, want %q", tt.host, approved, tt.want)
 		}
 	}
 }

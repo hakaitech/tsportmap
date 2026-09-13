@@ -58,7 +58,25 @@ type Recorder interface {
 // Allowed reports whether addr is permitted by prefixes. An empty prefix list
 // permits everything, which is the documented default: the bind address and the
 // operator's network are the access control.
+//
+// A nil addr is refused, and is refused ahead of the empty-list fast path: an
+// empty list means "any identifiable source", not "any source at all", so a
+// peer nothing can name must not be waved through merely because no allow list
+// was configured. Nothing is lost by refusing it. An address only goes missing
+// once the connection behind it is already dead, and one rule — an
+// unidentifiable source is never admitted — is far easier to reason about than
+// a rule whose answer flips with the presence of an allow list.
+//
+// Ingress conns come from tsnet's gVisor stack, and *gonet.TCPConn.RemoteAddr
+// returns a nil net.Addr once its endpoint has reached an error or closed
+// state; a peer that connects and immediately resets reaches one before the
+// relay ever looks. Allowed must therefore never dereference addr blindly: it
+// runs on the per-session goroutine, so a panic here would take down every
+// mapping in the process, not just this session.
 func Allowed(prefixes []netip.Prefix, addr net.Addr) bool {
+	if addr == nil {
+		return false
+	}
 	if len(prefixes) == 0 {
 		return true
 	}
@@ -100,6 +118,12 @@ const (
 	ReasonNotTailnet = "not_tailnet"
 	// ReasonOther is every reason not named here.
 	ReasonOther = "other"
+	// ReasonQueueFull is a datagram dropped because the session's egress queue
+	// was already full — the target has stopped draining writes. It is distinct
+	// from ReasonSessionCap, which is a whole session refused because the table
+	// was full: one says an admitted client is losing traffic, the other says a
+	// new client was never admitted, and an operator alerts on them differently.
+	ReasonQueueFull = "queue_full"
 	// ReasonRefused is an onward dial actively refused by the target.
 	ReasonRefused = "refused"
 	// ReasonSessionCap is a session refused because the session table was

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -100,6 +101,19 @@ func ServeTCP(ctx context.Context, ln net.Listener, dial DialFunc, opts Options)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			// Defence in depth rather than a fix for any one bug: a panic on
+			// this goroutine is otherwise fatal to the whole program, so one
+			// poisoned session would take down every other mapping in the
+			// process along with it. The sessions sharing this process belong
+			// to unrelated mappings that did nothing wrong, so the blast radius
+			// is held to the session that caused it.
+			defer func() {
+				if r := recover(); r != nil {
+					slog.ErrorContext(ctx, "relay: session panicked",
+						"mapping", opts.Name, "panic", r, "stack", string(debug.Stack()))
+					conn.Close()
+				}
+			}()
 			handleTCP(ctx, conn, dial, opts, rec)
 		}()
 	}
@@ -108,10 +122,16 @@ func ServeTCP(ctx context.Context, ln net.Listener, dial DialFunc, opts Options)
 // handleTCP owns client from the moment it is accepted: every path below either
 // hands it to pipe, which closes it, or closes it directly.
 func handleTCP(ctx context.Context, client net.Conn, dial DialFunc, opts Options, rec Recorder) {
-	if !Allowed(opts.Allow, client.RemoteAddr()) {
+	// The peer address is read once and reused. tsnet's gVisor-backed conn
+	// derives it from live endpoint state, so a second call can answer
+	// differently — including with nil — from the one the allow-list decision
+	// was made on, which is how a check and the log line describing it end up
+	// disagreeing about the same connection.
+	remote := client.RemoteAddr()
+	if !Allowed(opts.Allow, remote) {
 		rec.Rejected(opts.Name, ReasonAllowList)
 		slog.WarnContext(ctx, "relay: source rejected by allow list",
-			"mapping", opts.Name, "remote", client.RemoteAddr().String())
+			"mapping", opts.Name, "remote", addrString(remote))
 		client.Close()
 		return
 	}
@@ -132,6 +152,16 @@ func handleTCP(ctx context.Context, client net.Conn, dial DialFunc, opts Options
 	slog.DebugContext(ctx, "relay: session closed",
 		"mapping", opts.Name, "target", opts.Target,
 		"up_bytes", up, "down_bytes", down, "duration", d)
+}
+
+// addrString renders an address as a log field without assuming there is one.
+// A net.Addr can be nil — see Allowed — and the line reporting a refused
+// connection is the last place in the relay that should be able to panic.
+func addrString(a net.Addr) string {
+	if a == nil {
+		return "unknown"
+	}
+	return a.String()
 }
 
 // dialOnward bounds a single dial. The timeout context is released as soon as

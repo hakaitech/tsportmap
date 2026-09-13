@@ -112,11 +112,12 @@ Metrics exported: `tsportmap_build_info`, `tsportmap_sessions_opened_total`,
 `tsportmap_sessions_closed_total`, `tsportmap_sessions_active`,
 `tsportmap_bytes_total` (labelled `direction="up"|"down"`),
 `tsportmap_dial_failures_total`, `tsportmap_rejected_total` and
-`tsportmap_session_duration_seconds`. All are labelled by `mapping`; the failure
-and rejection counters carry a `reason` from a closed set — `allow_list`,
-`dial_timeout`, `not_tailnet`, `refused`, `session_cap`, `other` — so a novel
-error string from the network stack cannot mint a new time series per
-connection.
+`tsportmap_session_duration_seconds`. Every one of them is labelled by
+`mapping` except `tsportmap_build_info`, which carries only `version`. The
+failure and rejection counters carry a `reason` from a closed set —
+`allow_list`, `canceled`, `dial_timeout`, `dns`, `not_tailnet`, `other`,
+`queue_full`, `refused`, `session_cap` — so a novel error string from the
+network stack cannot mint a new time series per connection.
 
 Flags: `--validate` and `--version`. Everything else is environment.
 
@@ -127,9 +128,18 @@ Flags: `--validate` and `--version`. Everything else is environment.
 Configuration is environment-only. Every problem is a startup error, never a
 warning: a mapping whose allow-list was silently dropped is worse than a process
 that refuses to start, because nothing downstream can distinguish "no
-allow-list" from "the allow-list I wrote was ignored". An unset variable and one
-set to the empty string mean the same thing — the default — because platform
-dashboards routinely leave declared variables blank.
+allow-list" from "the allow-list I wrote was ignored". For the **scalars**
+below, an unset variable and one set to the empty string mean the same thing —
+the default — because platform dashboards routinely leave declared variables
+blank.
+
+**Mappings are the exception.** A mapping is removed by *deleting* its
+variable, never by blanking it. An empty `TSPM_OUT_*` or `TSPM_IN_*` is not an
+absent mapping, it is an unparseable one, and it is a fatal startup error
+(`configuration: TSPM_OUT_A: "" is not a mapping`) that takes down every other
+relay declared alongside it. If your platform's dashboard can only blank a
+variable and not remove the row, remove it from the service definition itself,
+because leaving it blank stops the process.
 
 ### Scalars
 
@@ -183,9 +193,17 @@ Options, comma-separated after the target:
 
 An unknown option key is a startup error rather than a silently ignored field.
 So is a duplicated option, an empty option field, and two mappings that would
-claim the same listening socket — including the case where one is a wildcard
-bind (`:8080`, `0.0.0.0:8080`) that covers the address another mapping named
-explicitly.
+claim the same listening socket. Two mappings claim the same socket when they
+share a direction, a protocol and a port on an overlapping address — including
+the case where one is a wildcard bind (`:8080`, `0.0.0.0:8080`) that covers the
+address another mapping named explicitly. Different protocols on one port do
+not collide, and neither do opposite directions: an `out` mapping opens a real
+socket on the container's own network, while an `in` mapping's listener lives
+inside tsnet's netstack, bound to the node's tailnet addresses, and never
+creates a socket on the host at all. `TSPM_IN_APP='tcp,:8080,…'` alongside
+`TSPM_OUT_CACHE='tcp,0.0.0.0:8080,…'` is therefore two listeners on two
+separate network stacks, and is accepted. The `<NAME>` still has to differ:
+uniqueness of the name is a separate rule, and it holds across both prefixes.
 
 ### Worked examples
 
@@ -232,12 +250,19 @@ address in both families.
 TSPM_IN_DNS='udp,:5353,127.0.0.1:5353'
 ```
 
-UDP is bounded: at most 4096 concurrent sessions per mapping, and datagrams
-queued for a client whose onward dial has not yet completed are capped and then
-dropped. Overflow is counted under `reason="session_cap"`. A single datagram
-from a new source address mints a session, and nothing about UDP makes the
-sender prove it exists first, so these caps are the difference between a bounded
-worst case and unbounded growth.
+UDP is bounded in two independent places. The session table holds at most 4096
+concurrent sessions per mapping; a datagram from a new source that would exceed
+it is dropped and counted under
+`tsportmap_rejected_total{reason="session_cap"}`, and no established session is
+ever evicted to make room for it. Each session then has its own short egress
+queue, holding the datagrams that arrive while the onward dial is still in
+flight or while a target has stopped draining what is written to it; a datagram
+that arrives when that queue is full is dropped and counted under
+`tsportmap_rejected_total{reason="queue_full"}`. The two are deliberately
+separate: `session_cap` says a new client was never admitted, `queue_full` says
+an admitted client is losing traffic because its target stopped draining. A single datagram from a new source address mints a
+session, and nothing about UDP makes the sender prove it exists first, so these
+caps are the difference between a bounded worst case and unbounded growth.
 
 ---
 
@@ -491,8 +516,11 @@ Read this section as the honest list of what will bite you.
   instances are two independent nodes, and if both want the same hostname,
   MagicDNS will suffix one of them.
 - **UDP is best-effort by construction.** Sessions are capped at 4096 per
-  mapping and pending datagrams for an unfinished dial are dropped on overflow.
-  Both are visible in `tsportmap_rejected_total{reason="session_cap"}`.
+  mapping, and each session's egress queue is capped as well, so a datagram is
+  dropped whenever either is full. The two are counted apart: a session refused
+  by a full table under `tsportmap_rejected_total{reason="session_cap"}`, a
+  datagram dropped by a full egress queue under
+  `tsportmap_rejected_total{reason="queue_full"}`.
 
 ---
 
