@@ -6,14 +6,16 @@ import (
 	"time"
 )
 
-// Direction is which way a mapping moves bytes across the tailnet boundary.
+// Direction is which way a mapping moves bytes across the boundary between the
+// container's own network and the mapping's network — its tailnet, a WireGuard
+// interface, or, for a plain forwarder, the container's network on both sides.
 type Direction string
 
 const (
-	// Out is egress: a listener on a local/private network accepts a connection
-	// and it is dialled onward to a tailnet peer via the tsnet node.
+	// Out is egress: a listener on the container's own network accepts a
+	// connection and it is dialled onward over the mapping's network.
 	Out Direction = "out"
-	// In is ingress: a listener on the tailnet accepts a connection from a peer
+	// In is ingress: a listener on the mapping's network accepts a connection
 	// and it is dialled onward to a target reachable from this container.
 	In Direction = "in"
 )
@@ -46,16 +48,27 @@ type Mapping struct {
 	// laptop wants 127.0.0.1. No portable default exists and a wrong one is an
 	// open relay.
 	//
-	// For In mappings this is an address on the tailnet side. An empty host
-	// means "this node's own tailnet addresses", which tsnet handles natively
-	// for TCP. For UDP an empty host is resolved to a concrete tailnet IP at
-	// bind time, because tsnet's ListenPacket rejects wildcard binds
-	// (tailscale/tailscale#18995).
+	// For In mappings this is an address on the mapping's network. An empty
+	// host means "every address this node holds on that network". On the
+	// tailnet that is native for TCP, while for UDP it is resolved to a
+	// concrete tailnet IP at bind time because tsnet's ListenPacket rejects
+	// wildcard binds (tailscale/tailscale#18995); a WireGuard interface accepts
+	// a wildcard for both.
 	Listen string
 
-	// Target is the far side, "host:port". For Out mappings a MagicDNS short
-	// name is preferred over an FQDN: short names survive a tailnet rename.
+	// Target is the far side, "host:port".
+	//
+	// On the tailnet a MagicDNS short name is preferred over an FQDN: short
+	// names survive a tailnet rename. Over a WireGuard interface the host must
+	// be a literal IP — a WireGuard tunnel carries no resolver of its own, and
+	// resolving a tunnel-side name on the container's resolver is the same
+	// silent-wrong-destination failure the tailnet guard exists to prevent.
 	Target string
+
+	// Via is the network this mapping uses: which plane an Out mapping dials
+	// over, and which plane an In mapping listens on. It defaults to the
+	// tailnet, so a mapping written without via= keeps its original meaning.
+	Via Network
 
 	// TLS terminates TLS on an In mapping using the node's Tailscale-issued
 	// certificate. Requires MagicDNS and HTTPS certificates to be enabled on
@@ -127,6 +140,12 @@ type Config struct {
 
 	Maps []Mapping
 
+	// WG are the userspace WireGuard interfaces declared by TSPM_WG_<NAME>.
+	// Each is brought up in-process with no TUN device and no NET_ADMIN, the
+	// same way the tailnet node is, so holding several costs nothing but
+	// memory and one UDP socket apiece.
+	WG []WGInterface
+
 	// MetricsAddr serves /healthz, /readyz and /metrics. Defaults to loopback;
 	// these endpoints are unauthenticated.
 	MetricsAddr string
@@ -145,3 +164,119 @@ type Config struct {
 
 	LogLevel string
 }
+
+// NetworkKind names a transport plane a mapping can use. tsportmap holds more
+// than one at a time: the embedded Tailscale node, any number of userspace
+// WireGuard interfaces, and the container's own stack. A mapping names exactly
+// one, which is what makes "what can this reach" answerable by reading the
+// configuration.
+type NetworkKind string
+
+const (
+	// NetTailnet is the embedded Tailscale node. It is the default, so a
+	// configuration written before WireGuard existed keeps its meaning.
+	NetTailnet NetworkKind = "ts"
+	// NetWireGuard is a userspace WireGuard interface declared by TSPM_WG_<NAME>.
+	NetWireGuard NetworkKind = "wg"
+	// NetLocal is the container's own network stack: no tunnel at all. It turns
+	// a mapping into a plain port forwarder, which is what makes this usable as
+	// one proxy in front of tunnelled and untunnelled destinations alike.
+	NetLocal NetworkKind = "local"
+)
+
+// Network is a resolved via= value: which plane, and for WireGuard which
+// interface on it.
+type Network struct {
+	Kind NetworkKind
+	// Name is the WireGuard interface name, lowercased for lookup. It is empty
+	// for every other kind.
+	Name string
+}
+
+// String renders a Network in the same spelling via= accepts, so a log line, an
+// error and the configuration an operator wrote all agree.
+func (n Network) String() string {
+	if n.Kind == NetWireGuard {
+		return string(NetWireGuard) + ":" + n.Name
+	}
+	if n.Kind == "" {
+		return string(NetTailnet)
+	}
+	return string(n.Kind)
+}
+
+// IsTailnet reports whether this network is the embedded Tailscale node.
+//
+// The zero Network counts as the tailnet. The parser always sets the kind, so
+// a zero value only arises from a Mapping built in code rather than parsed —
+// and the alternative, a zero value that belongs to no network at all, would
+// make such a mapping bind nowhere while String still called it "ts".
+func (n Network) IsTailnet() bool { return n.Kind == NetTailnet || n.Kind == "" }
+
+// WGPeer is one peer of a userspace WireGuard interface, as parsed from a
+// [Peer] section.
+type WGPeer struct {
+	// PublicKey is the peer's public key, base64 as WireGuard writes it. It is
+	// public by construction, so it is safe in logs and is what labels the
+	// peer's metrics — the same identifier `wg show` prints.
+	PublicKey string
+
+	// PresharedKey is the optional symmetric key mixed into the handshake.
+	// Secret: never logged, never rendered by --validate.
+	PresharedKey string
+
+	// AllowedIPs is the set of destinations routed to this peer, and on the
+	// inbound side the set of source addresses accepted from it. Required:
+	// WireGuard has no route to a peer without it.
+	AllowedIPs []netip.Prefix
+
+	// Endpoint is the peer's address on the container's own network,
+	// "host:port". It may be empty for a peer that always initiates, and it may
+	// be a DNS name, which is resolved on the host's resolver — correctly so,
+	// since the endpoint is reached outside the tunnel.
+	Endpoint string
+
+	// Keepalive sends a keepalive every interval, which is what holds a NAT
+	// binding open for a peer behind one. Zero disables it.
+	Keepalive time.Duration
+}
+
+// WGInterface is one userspace WireGuard interface, declared by TSPM_WG_<NAME>
+// and configured in the wg-quick INI format that every WireGuard deployment
+// already produces.
+type WGInterface struct {
+	// Name is the operator-supplied label from the variable's suffix. It labels
+	// logs and metrics and is what a mapping's via=wg:<name> refers to.
+	Name string
+
+	// PrivateKey is the interface's own private key, base64. Secret: never
+	// logged, never rendered by --validate.
+	PrivateKey string
+
+	// Addresses are the interface's own addresses inside the tunnel, with the
+	// prefix length from the config. At least one is required: a stack with no
+	// address has nothing to send from.
+	Addresses []netip.Prefix
+
+	// ListenPort is the UDP port on the container's own network that carries
+	// the encrypted tunnel. Zero lets the kernel choose, which is right for an
+	// interface that only ever initiates and wrong for one a peer must reach.
+	ListenPort int
+
+	// MTU is the tunnel's MTU. DefaultWGMTU when the config omits it.
+	MTU int
+
+	Peers []WGPeer
+}
+
+// DefaultWGMTU is wg-quick's own default: 1420 leaves room for the WireGuard
+// header inside a 1500-byte path.
+const DefaultWGMTU = 1420
+
+// MinWGMTU is the smallest MTU that can carry an IPv6 packet, which is the
+// floor gVisor's stack will work at.
+const MinWGMTU = 1280
+
+// MaxWGMTU bounds the MTU at the largest jumbo frame, so a typo of 14200 is a
+// startup error rather than an interface that silently black-holes.
+const MaxWGMTU = 9000

@@ -1,11 +1,14 @@
 // Package app wires tsportmap's parts together: it turns an environment into a
-// configuration, brings the embedded Tailscale node up, binds every declared
-// mapping, and runs them until it is asked to stop.
+// configuration, brings up every network the configuration names — the embedded
+// Tailscale node, the userspace WireGuard interfaces, or neither — binds every
+// declared mapping to the network it belongs on, and runs them until it is
+// asked to stop.
 //
-// Everything here is startup order and shutdown order. The relays, the node and
-// the metrics registry each work on their own; what this package owns is the
+// Everything here is startup order and shutdown order. The relays, the networks
+// and the metrics registry each work on their own; what this package owns is the
 // sequence that makes them safe together — bind before ready, drain before
-// close, and close the node after everything that might still dial through it.
+// close, and close the networks after everything that might still dial through
+// one of them.
 package app
 
 import (
@@ -18,6 +21,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,6 +32,7 @@ import (
 	"github.com/hakaitech/tsportmap/internal/obs"
 	"github.com/hakaitech/tsportmap/internal/relay"
 	"github.com/hakaitech/tsportmap/internal/tsnode"
+	"github.com/hakaitech/tsportmap/internal/wgnet"
 )
 
 // metricsShutdownTimeout bounds draining the status server. It is short because
@@ -77,10 +82,10 @@ func newTailscaleNode(cfg *config.Config, log *slog.Logger) (node, error) {
 // environ is an os.Environ()-style slice rather than being read from the
 // process, so the whole startup path is exercisable from a test.
 func Run(ctx context.Context, environ []string, version string, stderr io.Writer) error {
-	return run(ctx, environ, version, stderr, newTailscaleNode)
+	return run(ctx, environ, version, stderr, newTailscaleNode, newWireGuardInterface)
 }
 
-func run(ctx context.Context, environ []string, version string, stderr io.Writer, newNode nodeFactory) error {
+func run(ctx context.Context, environ []string, version string, stderr io.Writer, newNode nodeFactory, newWG wgFactory) error {
 	if stderr == nil {
 		stderr = os.Stderr
 	}
@@ -106,32 +111,29 @@ func run(ctx context.Context, environ []string, version string, stderr io.Writer
 
 	reg := obs.NewRegistry()
 
-	n, err := newNode(cfg, logger)
+	nets, err := buildNetworks(cfg, logger, newNode, newWG)
 	if err != nil {
 		return err
 	}
-	// closeNode runs exactly once. The deferred call is the backstop for the
-	// early returns below; the ordered shutdown at the end calls it explicitly
-	// so that the node outlives every relay that might still be dialling
-	// through it.
+	// closeNetworks runs exactly once. The deferred call is the backstop for
+	// the early returns below; the ordered shutdown at the end calls it
+	// explicitly so that every network outlives the relays that might still be
+	// dialling through it.
 	var closeOnce sync.Once
-	closeNode := func() {
-		closeOnce.Do(func() {
-			if err := n.Close(); err != nil {
-				logger.Warn("closing tailnet node", "error", err)
-			}
-		})
+	closeNetworks := func() {
+		closeOnce.Do(func() { nets.Close(logger) })
 	}
-	defer closeNode()
+	defer closeNetworks()
 
-	if err := n.Start(ctx); err != nil {
+	if err := nets.Start(ctx); err != nil {
 		return err
 	}
+	reg.SetWireGuard(nets.wireGuardStats())
 
 	// Every listener is bound before anything is declared ready. A mapping that
 	// cannot bind is a mapping an operator declared and is not getting, and a
 	// half-served configuration hides that behind the mappings that did work.
-	bounds, err := bindAll(cfg, n, reg)
+	bounds, err := bindAll(cfg, nets, reg)
 	if err != nil {
 		return err
 	}
@@ -141,7 +143,7 @@ func run(ctx context.Context, environ []string, version string, stderr io.Writer
 		if !ready.Load() {
 			return errors.New("listeners are not serving")
 		}
-		return n.Running(ctx)
+		return nets.Running(ctx)
 	})
 
 	// The status listener is bound here rather than inside ListenAndServe so
@@ -173,6 +175,7 @@ func run(ctx context.Context, environ []string, version string, stderr io.Writer
 			"mapping", b.m.Name,
 			"dir", string(b.m.Dir),
 			"proto", string(b.m.Proto),
+			"via", b.m.Via.String(),
 			"listen", b.addr,
 			"target", b.m.Target,
 			"tls", b.m.TLS,
@@ -227,10 +230,10 @@ func run(ctx context.Context, environ []string, version string, stderr io.Writer
 	}
 	cancel()
 
-	// The node goes last: a relay still finishing a session is still using its
-	// dialer and its listeners, and tearing the tailnet out from under one
-	// turns an orderly drain into a truncated response.
-	closeNode()
+	// The networks go last: a relay still finishing a session is still using a
+	// dialer and a listener that belongs to one, and tearing a tunnel out from
+	// under it turns an orderly drain into a truncated response.
+	closeNetworks()
 	logger.Info("stopped")
 	return runErr
 }
@@ -391,12 +394,12 @@ func closeBounds(bounds []*bound) {
 // listeners open would keep those ports claimed for as long as it takes the
 // supervisor to notice, and the restart would then fail to bind for a second,
 // unrelated-looking reason.
-func bindAll(cfg *config.Config, n node, reg *obs.Registry) ([]*bound, error) {
-	ip4, ip6 := n.TailnetIPs()
+func bindAll(cfg *config.Config, nets *networks, reg *obs.Registry) ([]*bound, error) {
+	ip4, ip6 := nets.tailnetIPs()
 
 	bounds := make([]*bound, 0, len(cfg.Maps))
 	for _, m := range cfg.Maps {
-		b, err := bindOne(m, n, ip4, ip6, reg)
+		b, err := bindOne(m, nets, ip4, ip6, reg)
 		if err != nil {
 			closeBounds(bounds)
 			return nil, fmt.Errorf("mapping %s (%s): %w", m.Name, envVarFor(m), err)
@@ -406,43 +409,36 @@ func bindAll(cfg *config.Config, n node, reg *obs.Registry) ([]*bound, error) {
 	return bounds, nil
 }
 
-func bindOne(m config.Mapping, n node, ip4, ip6 netip.Addr, reg *obs.Registry) (*bound, error) {
-	b := &bound{m: m, addr: m.Listen, dial: dialFunc(m, n, reg)}
+func bindOne(m config.Mapping, nets *networks, ip4, ip6 netip.Addr, reg *obs.Registry) (*bound, error) {
+	dial, err := nets.dialer(m)
+	if err != nil {
+		return nil, err
+	}
+	b := &bound{m: m, addr: m.Listen, dial: recordingDial(m, dial, reg)}
 
 	switch {
-	case m.Dir == config.Out && m.Proto == config.TCP:
-		ln, err := net.Listen("tcp", m.Listen)
+	case m.Proto == config.TCP:
+		ln, err := nets.listen(m, m.Listen)
 		if err != nil {
-			return nil, fmt.Errorf("listening on %s: %w", m.Listen, err)
+			return nil, fmt.Errorf("listening on %s at %s: %w", listenNetworkDescription(m), m.Listen, err)
 		}
 		b.ln = newTrackingListener(ln)
 
-	case m.Dir == config.Out && m.Proto == config.UDP:
-		pc, err := net.ListenPacket("udp", m.Listen)
-		if err != nil {
-			return nil, fmt.Errorf("listening on %s: %w", m.Listen, err)
+	case m.Proto == config.UDP:
+		addr := m.Listen
+		// Only a tailnet ingress mapping needs its wildcard resolved: tsnet
+		// rejects a wildcard packet bind, while the host stack and a WireGuard
+		// interface both accept one.
+		if m.Dir == config.In && m.Via.IsTailnet() {
+			resolved, err := ingressPacketAddr(m, ip4, ip6)
+			if err != nil {
+				return nil, err
+			}
+			addr = resolved
 		}
-		b.pc = pc
-
-	case m.Dir == config.In && m.Proto == config.TCP:
-		listen := n.Listen
-		if m.TLS {
-			listen = n.ListenTLS
-		}
-		ln, err := listen("tcp", m.Listen)
+		pc, err := nets.listenPacket(m, addr)
 		if err != nil {
-			return nil, fmt.Errorf("listening on the tailnet at %s: %w", m.Listen, err)
-		}
-		b.ln = newTrackingListener(ln)
-
-	case m.Dir == config.In && m.Proto == config.UDP:
-		addr, err := ingressPacketAddr(m, ip4, ip6)
-		if err != nil {
-			return nil, err
-		}
-		pc, err := n.ListenPacket("udp", addr)
-		if err != nil {
-			return nil, fmt.Errorf("listening on the tailnet at %s: %w", addr, err)
+			return nil, fmt.Errorf("listening on %s at %s: %w", listenNetworkDescription(m), addr, err)
 		}
 		b.addr, b.pc = addr, pc
 
@@ -513,23 +509,14 @@ func ingressPacketAddr(m config.Mapping, ip4, ip6 netip.Addr) (string, error) {
 		"name one of the node's own tailnet addresses explicitly once it has been assigned", m.Listen)
 }
 
-// dialFunc builds the onward leg for a mapping.
+// recordingDial wraps a mapping's onward dialer so that a failure is recorded
+// here, classified from the error.
 //
-// The direction decides the dialer and nothing else does: an egress mapping
-// dials a tailnet peer through the node, where the destination guard can refuse
-// a target that is not on the tailnet, while an ingress mapping dials a target
-// that is local to this container and must not go through the tailnet at all.
-//
-// The wrapper records dial failures itself, from the error, because it is the
-// only place that can tell a destination the guard refused from an ordinary
-// connection failure — and that distinction is the one an operator most needs
-// to see in a metric.
-func dialFunc(m config.Mapping, n node, reg *obs.Registry) relay.DialFunc {
-	dial := relay.DialFunc(n.DialContext)
-	if m.Dir == config.In {
-		d := &net.Dialer{}
-		dial = d.DialContext
-	}
+// This is the only place that can tell a destination a guard refused from an
+// ordinary connection failure, and that distinction is the one an operator most
+// needs to see in a metric: a refusal is a configuration mistake with a fix, a
+// connection failure is usually somebody else's outage.
+func recordingDial(m config.Mapping, dial relay.DialFunc, reg *obs.Registry) relay.DialFunc {
 	name := m.Name
 	return func(ctx context.Context, network, address string) (net.Conn, error) {
 		c, err := dial(ctx, network, address)
@@ -541,10 +528,28 @@ func dialFunc(m config.Mapping, n node, reg *obs.Registry) relay.DialFunc {
 }
 
 func dialFailureReason(err error) string {
-	if errors.Is(err, tsnode.ErrNotTailnet) {
+	switch {
+	case errors.Is(err, tsnode.ErrNotTailnet):
 		return obs.ReasonNotTailnet
+	case errors.Is(err, wgnet.ErrNoRoute):
+		return obs.ReasonNoRoute
+	default:
+		return obs.ReasonForError(err)
 	}
-	return obs.ReasonForError(err)
+}
+
+// listenNetworkDescription names, for an error message, the network a
+// mapping's listener lives on.
+func listenNetworkDescription(m config.Mapping) string {
+	if m.Dir == config.Out {
+		return "the container's own network"
+	}
+	switch m.Via.Kind {
+	case config.NetWireGuard:
+		return "WireGuard interface " + m.Via.Name
+	default:
+		return "the tailnet"
+	}
 }
 
 // relayRecorder adapts the relay's accounting to the metric registry.
@@ -618,6 +623,14 @@ func envVarFor(m config.Mapping) string {
 	return config.EnvPrefixOut + m.Name
 }
 
+func prefixesString(ps []netip.Prefix) string {
+	parts := make([]string, len(ps))
+	for i, p := range ps {
+		parts[i] = p.String()
+	}
+	return strings.Join(parts, ",")
+}
+
 func allowString(m config.Mapping) string {
 	if len(m.Allow) == 0 {
 		return "any"
@@ -662,7 +675,10 @@ const oauthSecretPrefix = "tskey-client-"
 // then rejects is worse than no gate at all, and each of these fails at a
 // point where the error names a symptom rather than the setting at fault.
 func checkStartup(environ []string, cfg *config.Config) error {
-	if strings.HasPrefix(cfg.AuthKey, oauthSecretPrefix) && len(cfg.Tags) == 0 {
+	// The credential is only read when a node is actually started, so a
+	// WireGuard-only configuration must not be failed over the shape of a key
+	// nothing will present.
+	if needsTailnet(cfg) && strings.HasPrefix(cfg.AuthKey, oauthSecretPrefix) && len(cfg.Tags) == 0 {
 		return fmt.Errorf("%s holds an OAuth client secret (it begins %q) but %s is empty: "+
 			"the auth key minted from a client secret is always tagged, so the node cannot register without tags. "+
 			"Set %s to the tags the OAuth client is authorised for, for example %s=tag:proxy",
@@ -774,7 +790,14 @@ func writeSummary(w io.Writer, cfg *config.Config, version string) error {
 	if tags == "" {
 		tags = "(none)"
 	}
-	for _, row := range [][2]string{
+	rows := [][2]string{}
+	if !needsTailnet(cfg) {
+		// Everything below this line describes a node that is not going to be
+		// started, so say so before an operator debugs an auth key that is
+		// never read.
+		rows = append(rows, [2]string{"tailnet node", "not started (no mapping uses via=ts)"})
+	}
+	for _, row := range append(rows, [][2]string{
 		{"hostname", cfg.Hostname},
 		{"auth key", authKey},
 		{"tags", tags},
@@ -788,19 +811,57 @@ func writeSummary(w io.Writer, cfg *config.Config, version string) error {
 		{"up timeout", cfg.UpTimeout.String()},
 		{"shutdown grace", cfg.ShutdownGrace.String()},
 		{"log level", cfg.LogLevel},
-	} {
+	}...) {
 		fmt.Fprintf(tw, "  %s:\t%s\n", row[0], row[1])
 	}
 	if err := tw.Flush(); err != nil {
 		return err
 	}
 
+	if len(cfg.WG) > 0 {
+		fmt.Fprintf(&b, "\nwireguard interfaces (%d):\n", len(cfg.WG))
+		wt := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
+		// No key material is printed, not even the interface's public key,
+		// which would be derived from the private one. The peers' public keys
+		// are printed because they are public, and because matching them
+		// against `wg show` on the far side is the first thing an operator does
+		// when a tunnel is not carrying traffic.
+		fmt.Fprintf(wt, "  NAME\tADDRESSES\tLISTEN PORT\tMTU\tPEER\tENDPOINT\tALLOWED IPS\tKEEPALIVE\n")
+		for _, w := range cfg.WG {
+			port := "ephemeral"
+			if w.ListenPort > 0 {
+				port = strconv.Itoa(w.ListenPort)
+			}
+			for i, p := range w.Peers {
+				name, addrs, mtu := w.Name, prefixesString(w.Addresses), strconv.Itoa(w.MTU)
+				if i > 0 {
+					// One row per peer, with the interface's own columns blank
+					// after the first so the grouping is visible at a glance.
+					name, addrs, port, mtu = "", "", "", ""
+				}
+				endpoint := p.Endpoint
+				if endpoint == "" {
+					endpoint = "(peer must initiate)"
+				}
+				keepalive := "off"
+				if p.Keepalive > 0 {
+					keepalive = p.Keepalive.String()
+				}
+				fmt.Fprintf(wt, "  %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+					name, addrs, port, mtu, p.PublicKey, endpoint, prefixesString(p.AllowedIPs), keepalive)
+			}
+		}
+		if err := wt.Flush(); err != nil {
+			return err
+		}
+	}
+
 	fmt.Fprintf(&b, "\nmappings (%d):\n", len(cfg.Maps))
 	mt := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
-	fmt.Fprintf(mt, "  NAME\tDIR\tPROTO\tLISTEN\tTARGET\tTLS\tALLOW\tIDLE\n")
+	fmt.Fprintf(mt, "  NAME\tDIR\tVIA\tPROTO\tLISTEN\tTARGET\tTLS\tALLOW\tIDLE\n")
 	for _, m := range cfg.Maps {
-		fmt.Fprintf(mt, "  %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			m.Name, m.Dir, m.Proto, m.Listen, m.Target,
+		fmt.Fprintf(mt, "  %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			m.Name, m.Dir, m.Via, m.Proto, m.Listen, m.Target,
 			fmt.Sprint(m.TLS), allowString(m), m.Idle)
 	}
 	if err := mt.Flush(); err != nil {
@@ -834,15 +895,36 @@ func mappingNotes(m config.Mapping) []string {
 			wildcard = true
 		}
 	}
-	if m.Dir == config.In && m.Proto == config.UDP && wildcard {
+	if m.Dir == config.In && m.Proto == config.UDP && wildcard && m.Via.IsTailnet() {
 		notes = append(notes, fmt.Sprintf("listen %q binds every address, which tsnet rejects for UDP; "+
 			"one of this node's own tailnet addresses is substituted at startup and the bound address is logged", m.Listen))
 	}
 	if m.Dir == config.Out && len(m.Allow) == 0 && !loopbackOnly(host) {
 		notes = append(notes, fmt.Sprintf("listen %q is not loopback and has no allow list, so anything that can reach that address "+
-			"can use this mapping to reach %s over the tailnet", m.Listen, m.Target))
+			"can use this mapping to reach %s over %s", m.Listen, m.Target, viaDescription(m.Via)))
+	}
+	if m.Dir == config.Out && m.Via.Kind == config.NetLocal {
+		// via=local is the one mapping kind with no tunnel and therefore no
+		// destination guard of any sort. That is what it is for, and it is also
+		// the thing least like the rest of this tool, so it is stated rather
+		// than left to be inferred from the absence of a tailnet column.
+		notes = append(notes, fmt.Sprintf("via=%s is a plain forwarder: %s is dialled on the container's own network, with no tunnel and no destination guard. "+
+			"Whatever answers at that address on this network is what a client reaches", config.NetLocal, m.Target))
 	}
 	return notes
+}
+
+// viaDescription names a network the way a sentence needs it, as opposed to the
+// way via= spells it.
+func viaDescription(n config.Network) string {
+	switch n.Kind {
+	case config.NetWireGuard:
+		return "WireGuard interface " + n.Name
+	case config.NetLocal:
+		return "the container's own network"
+	default:
+		return "the tailnet"
+	}
 }
 
 func loopbackOnly(host string) bool {

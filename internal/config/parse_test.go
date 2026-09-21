@@ -361,14 +361,14 @@ func TestFromEnvErrors(t *testing.T) {
 			"TSPM_OUT_a=tcp,0.0.0.0:8080,one:8080",
 			"TSPM_OUT_b=tcp,0.0.0.0:8080,two:8080",
 		},
-		want: []string{"TSPM_OUT_a", "TSPM_OUT_b", "0.0.0.0:8080", `"out"`},
+		want: []string{"TSPM_OUT_a", "TSPM_OUT_b", "0.0.0.0:8080", "the container's own network"},
 	}, {
 		name: "two in mappings spelled identically",
 		environ: []string{
 			"TSPM_IN_a=tcp,:8080,127.0.0.1:8080",
 			"TSPM_IN_b=tcp,:8080,127.0.0.1:8081",
 		},
-		want: []string{"TSPM_IN_a", "TSPM_IN_b", ":8080", `"in"`},
+		want: []string{"TSPM_IN_a", "TSPM_IN_b", ":8080", "the tailnet"},
 	}, {
 		name: "duplicate listen written two ways",
 		environ: []string{
@@ -382,14 +382,14 @@ func TestFromEnvErrors(t *testing.T) {
 			"TSPM_IN_a=tcp,:8080,127.0.0.1:8080",
 			"TSPM_IN_b=tcp,100.64.0.1:8080,127.0.0.1:8081",
 		},
-		want: []string{"TSPM_IN_a", "TSPM_IN_b", "8080", "in"},
+		want: []string{"TSPM_IN_a", "TSPM_IN_b", "8080", "the tailnet"},
 	}, {
 		name: "wildcard declared after a specific address",
 		environ: []string{
 			"TSPM_IN_a=tcp,100.64.0.1:8080,127.0.0.1:8081",
 			"TSPM_IN_z=tcp,:8080,127.0.0.1:8080",
 		},
-		want: []string{"TSPM_IN_a", "TSPM_IN_z", "8080", "in"},
+		want: []string{"TSPM_IN_a", "TSPM_IN_z", "8080", "the tailnet"},
 	}, {
 		name: "unspecified address is a wildcard too",
 		environ: []string{

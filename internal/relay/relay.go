@@ -112,6 +112,13 @@ const (
 	ReasonDNS = "dns"
 	// ReasonDialTimeout is an onward dial that ran out of time.
 	ReasonDialTimeout = "dial_timeout"
+	// ReasonNoRoute is a destination outside every AllowedIPs on the WireGuard
+	// interface a mapping uses, so the dial was refused rather than handed to a
+	// tunnel with no peer to carry it. It is distinct from ReasonNotTailnet
+	// because the two name different networks and different fixes: one is a
+	// missing peer or subnet route on the tailnet, the other a missing
+	// AllowedIPs entry in a wg configuration.
+	ReasonNoRoute = "no_route"
 	// ReasonNotTailnet is a destination that could not be confirmed as a
 	// tailnet peer or an eligible route, so the dial was refused rather than
 	// allowed to fall through to the host network.

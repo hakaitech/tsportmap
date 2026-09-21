@@ -2,7 +2,12 @@ module github.com/hakaitech/tsportmap
 
 go 1.26.6
 
-require tailscale.com v1.102.4
+require (
+	github.com/tailscale/wireguard-go v0.0.0-20260715223240-2e01ba5b00f0
+	golang.org/x/crypto v0.54.0
+	gvisor.dev/gvisor v0.0.0-20260224225140-573d5e7127a8
+	tailscale.com v1.102.4
+)
 
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
@@ -32,11 +37,9 @@ require (
 	github.com/tailscale/hujson v0.0.0-20260302212456-ecc657c15afd // indirect
 	github.com/tailscale/peercred v0.0.0-20250107143737-35a0c7bd7edc // indirect
 	github.com/tailscale/web-client-prebuilt v0.0.0-20250124233751-d4cd19a26976 // indirect
-	github.com/tailscale/wireguard-go v0.0.0-20260715223240-2e01ba5b00f0 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	go4.org/mem v0.0.0-20240501181205-ae6ca9944745 // indirect
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba // indirect
-	golang.org/x/crypto v0.54.0 // indirect
 	golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f // indirect
 	golang.org/x/net v0.56.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
@@ -47,5 +50,4 @@ require (
 	golang.org/x/time v0.15.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 	golang.zx2c4.com/wireguard/windows v0.5.3 // indirect
-	gvisor.dev/gvisor v0.0.0-20260224225140-573d5e7127a8 // indirect
 )

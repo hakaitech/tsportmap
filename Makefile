@@ -30,9 +30,9 @@ lint:
 	go vet ./...
 	@test -z "$$(gofmt -l .)" || { echo 'gofmt needed:'; gofmt -l .; exit 1; }
 
-# Rewrites go.mod/go.sum in place and fails if that changed anything. tailscale.com
-# is meant to be the only third-party dependency; a diff here means something
-# pulled in another one or left a stale require line behind.
+# Rewrites go.mod/go.sum in place and fails if that changed anything. The
+# dependency set is meant to be tailscale.com and the modules it already pulls
+# in; a go.sum diff means a genuinely new module entered the build.
 tidy-check:
 	go mod tidy
 	git diff --exit-code -- go.mod go.sum

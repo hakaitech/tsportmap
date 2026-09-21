@@ -49,6 +49,9 @@ const (
 	ReasonDNS = relay.ReasonDNS
 	// ReasonDialTimeout is an onward dial that ran out of time.
 	ReasonDialTimeout = relay.ReasonDialTimeout
+	// ReasonNoRoute is a destination outside every AllowedIPs on the WireGuard
+	// interface a mapping uses.
+	ReasonNoRoute = relay.ReasonNoRoute
 	// ReasonNotTailnet is a destination the guard could not confirm is a
 	// tailnet peer or an eligible route, so the dial was refused rather than
 	// allowed to fall through to the host network.
@@ -72,6 +75,7 @@ var reasons = [...]string{
 	ReasonCanceled,
 	ReasonDNS,
 	ReasonDialTimeout,
+	ReasonNoRoute,
 	ReasonNotTailnet,
 	ReasonOther,
 	ReasonQueueFull,
@@ -144,6 +148,8 @@ type Registry struct {
 
 	mu    sync.RWMutex
 	stats map[string]*mapStats
+	// wg is consulted at scrape time; see SetWireGuard.
+	wg WireGuardSource
 }
 
 // NewRegistry returns a Recorder that also exposes Prometheus text metrics.
@@ -327,6 +333,11 @@ func (r *Registry) WritePrometheus(w io.Writer) error {
 		writeSample(&b, metricDuration+"_sum", mappingLabel(m.name), formatSeconds(m.stats.durNanos.Load()))
 		writeSample(&b, metricDuration+"_count", mappingLabel(m.name), strconv.FormatInt(m.stats.durCount.Load(), 10))
 	}
+
+	// Last, and omitted entirely on a node with no WireGuard interface, so that
+	// the exposition of a tailnet-only node is byte-for-byte what it was before
+	// WireGuard existed.
+	r.writeWireGuard(&b)
 
 	_, err := w.Write(b.Bytes())
 	return err

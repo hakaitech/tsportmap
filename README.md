@@ -1,19 +1,43 @@
 # tsportmap
 
-tsportmap is a single containerised Go binary that embeds one Tailscale node
-(via `tsnet`, in userspace — no `/dev/net/tun`, no `NET_ADMIN`) and relays
-**declared port mappings in both directions**: `out` mappings listen on the
-container's own network and dial onward to a tailnet peer, `in` mappings listen
-on the tailnet and dial onward to a target reachable from the container. What it
-is *not*: it is not a proxy in the general sense. There is no SOCKS5, no HTTP
-CONNECT, no ad-hoc destination selection and no dynamic configuration API. A
-caller can only ever reach a destination that an operator wrote into an
+tsportmap is a single containerised Go binary that relays **declared port
+mappings in both directions** across **several private networks at once**:
+
+- a **Tailscale tailnet**, via an embedded `tsnet` node;
+- any number of **conventional WireGuard interfaces**, each configured with an
+  ordinary `wg-quick` `.conf` file;
+- the **container's own network**, for a plain forwarder with no tunnel at all.
+
+Every one of those runs **in userspace** — no `/dev/net/tun`, no `NET_ADMIN`, no
+network namespace, no capabilities of any kind. A WireGuard interface here is a
+`wireguard-go` device moving packets across an in-process gVisor stack, exactly
+the trick `tsnet` plays for the tailnet, which is why one unprivileged process
+can hold both.
+
+An `out` mapping listens on the container's own network and dials onward over
+the network it names; an `in` mapping listens on that network and dials onward
+to a target reachable from the container. Which network a mapping uses is one
+option, `via=`:
+
+```sh
+TSPM_OUT_DB='tcp,0.0.0.0:5432,db-1:5432'                     # over the tailnet (the default)
+TSPM_OUT_METRICS='tcp,0.0.0.0:9090,10.8.0.5:9090,via=wg:hq'  # over a WireGuard interface
+TSPM_OUT_LEGACY='tcp,0.0.0.0:6379,cache.internal:6379,via=local'  # no tunnel at all
+```
+
+What it is *not*: it is not a proxy in the general sense. There is no SOCKS5, no
+HTTP CONNECT, no ad-hoc destination selection and no dynamic configuration API.
+A caller can only ever reach a destination that an operator wrote into an
 environment variable before the process started. That restriction is the
 product, not a missing feature — it is what makes the reachable set of a
-tsportmap node auditable by reading its configuration.
+tsportmap node auditable by reading its configuration, and adding WireGuard
+widens *which networks* it can be pointed at without widening *what it will
+reach* on any of them.
 
-MIT licensed. `tailscale.com` is the only third-party dependency; everything
-else is the standard library.
+MIT licensed. The dependency set is `tailscale.com` plus two modules it already
+pulls in and this now names directly — `github.com/tailscale/wireguard-go` and
+`gvisor.dev/gvisor` — and nothing else. Adding WireGuard added **zero** new
+modules to `go.sum`; everything outside those three is the standard library.
 
 ---
 
@@ -44,14 +68,31 @@ one of them is the better answer. In rough order of how often it applies:
   **unauthenticated**: bind it to loopback (`TS_SOCKS5_SERVER=localhost:1055`)
   and never to an address a neighbouring workload can reach.
 
+- **You want a WireGuard client in a container and you can give it
+  `NET_ADMIN`.** Run the official `linuxserver/wireguard` image, or `wg-quick`
+  in a privileged sidecar, and let the kernel do it. A kernel WireGuard
+  interface is faster than a userspace one and it makes the whole tunnel
+  available to every process in the namespace rather than to declared ports.
+  tsportmap's WireGuard support exists for the case where you *cannot* have
+  that: a PaaS that will not grant capabilities, a platform with no sidecars, or
+  a policy that says a container gets no privileges.
+
 tsportmap earns its place in one specific corner: you need **raw TCP or UDP**
-port maps, **in either direction**, on a platform that **is not Kubernetes**,
+port maps, **in either direction**, across **one or more private networks**, on
+a platform that **is not Kubernetes** and **will not give you privileges**,
 where the client **cannot be made proxy-aware**. The archetype is a database
 driver that opens a bare socket to `host:5432` and has no proxy setting — no
 `ALL_PROXY`, no SOCKS support in the connection string, no way to wrap it. For
 that case you need something that answers on a real local port and forwards, and
 you would like the set of destinations it can reach to be a short list you can
 read.
+
+The second archetype is the reason WireGuard is here at all: a service that has
+to reach **both** a tailnet host and a conventional WireGuard network — a
+partner's VPN, a colocation site, an appliance whose vendor hands you a `.conf`
+file — from one place, on a platform where the answer would otherwise be two
+privileged sidecars. tsportmap holds both tunnels in one unprivileged process
+and gives each destination its own local port.
 
 ---
 
@@ -95,8 +136,43 @@ docker run -d --name tsportmap \
 `psql -h 127.0.0.1 -p 5432` now reaches the tailnet host `db-1`. Nothing else on
 your tailnet is reachable through this container.
 
+### Quick start (WireGuard, no tailnet)
+
+The same binary with no Tailscale credential at all. Point it at the `.conf`
+file your VPN already gave you and declare the ports you want:
+
+```sh
+docker run -d --name tsportmap \
+  --cap-drop ALL --security-opt no-new-privileges:true \
+  -v /etc/wireguard/hq.conf:/run/secrets/hq.conf:ro \
+  -p 127.0.0.1:5432:5432 \
+  -e TSPM_WG_HQ='file:/run/secrets/hq.conf' \
+  -e TSPM_OUT_DB='tcp,0.0.0.0:5432,10.8.0.5:5432,via=wg:hq' \
+  tsportmap:dev
+```
+
+No `--cap-add NET_ADMIN`, no `--device /dev/net/tun`, no `--privileged`, and no
+state volume — a WireGuard interface has no registered identity to persist. When
+no mapping names the tailnet, **no Tailscale node is started at all**: no auth
+key is read, no device is registered, and the process cannot fail because a
+coordination server is unreachable. `--validate` says so in its first line:
+
+```
+  tailnet node:          not started (no mapping uses via=ts)
+```
+
+Mixing the two is the point, and costs nothing extra:
+
+```sh
+  -e TSPM_AUTHKEY='tskey-auth-...' \
+  -e TSPM_WG_HQ='file:/run/secrets/hq.conf' \
+  -e TSPM_OUT_DB='tcp,0.0.0.0:5432,db-1:5432' \
+  -e TSPM_OUT_APPLIANCE='tcp,0.0.0.0:8443,10.8.0.9:443,via=wg:hq' \
+```
+
 Ready-made deployments live in [`deploy/`](deploy): a Compose file that runs
-egress and ingress at once with the auth key supplied as a Docker secret, and a
+egress and ingress at once with the auth key supplied as a Docker secret, a
+second Compose file that adds a WireGuard interface alongside the tailnet, and a
 Render Blueprint.
 
 The status endpoints are served on `TSPM_METRICS_ADDR` (loopback by default,
@@ -115,9 +191,26 @@ Metrics exported: `tsportmap_build_info`, `tsportmap_sessions_opened_total`,
 `tsportmap_session_duration_seconds`. Every one of them is labelled by
 `mapping` except `tsportmap_build_info`, which carries only `version`. The
 failure and rejection counters carry a `reason` from a closed set —
-`allow_list`, `canceled`, `dial_timeout`, `dns`, `not_tailnet`, `other`,
-`queue_full`, `refused`, `session_cap` — so a novel error string from the
-network stack cannot mint a new time series per connection.
+`allow_list`, `canceled`, `dial_timeout`, `dns`, `no_route`, `not_tailnet`,
+`other`, `queue_full`, `refused`, `session_cap` — so a novel error string from
+the network stack cannot mint a new time series per connection.
+
+A node with at least one WireGuard interface also exports
+`tsportmap_wg_peer_last_handshake_seconds` and `tsportmap_wg_peer_bytes_total`,
+both labelled `interface` and `peer` (the peer's public key, exactly as
+`wg show` prints it); the byte counter adds `direction="rx"|"tx"`. A node with
+no WireGuard interface exports neither, rather than exporting them empty.
+
+**The handshake gauge is the one to alert on, and it is not a readiness
+signal.** WireGuard has no connect step: a handshake happens when there is a
+packet to carry or a keepalive falls due, and never otherwise. A peer with a
+wrong key, an unreachable endpoint or a firewall in the way is indistinguishable
+from a peer that is simply idle — right up until the first dial. Readiness
+therefore deliberately does not wait for a handshake, because an idle tunnel
+would fail it forever. Instead the last handshake time is published (`0` means
+"never") and you alert on it against your own knowledge of whether that tunnel
+should be carrying traffic. Setting `PersistentKeepalive` on a peer makes the
+signal continuous, which is most of why you would set it here.
 
 Flags: `--validate` and `--version`. Everything else is environment.
 
@@ -145,7 +238,7 @@ because leaving it blank stops the process.
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `TSPM_HOSTNAME` | `tsportmap` | The node's name in the tailnet and in MagicDNS. |
+| `TSPM_HOSTNAME` | `tsportmap` | The node's name in the tailnet and in MagicDNS. Unread when no mapping uses `via=ts`. |
 | `TSPM_AUTHKEY` | *(none)* | Auth key or OAuth client secret. A `file:/path` prefix reads the value from that path instead, keeping it out of `/proc/<pid>/environ` and platform dashboards. Trailing whitespace is trimmed. Never logged, not even a prefix or a length. |
 | `TS_AUTHKEY` | *(none)* | Fallback consulted only when `TSPM_AUTHKEY` is unset, so a container already configured for Tailscale needs no second variable. |
 | `TSPM_TAGS` | *(none)* | Comma-separated, e.g. `tag:proxy`. Each entry must start with `tag:`. **Required** when `TSPM_AUTHKEY` holds an OAuth client secret (`tskey-client-…`). |
@@ -153,7 +246,7 @@ because leaving it blank stops the process.
 | `TSPM_EPHEMERAL` | `false` | Register a node that control reaps on disconnect. |
 | `TSPM_CONTROL_URL` | *(empty)* | Empty means Tailscale's coordination server. Set this for Headscale. |
 | `TSPM_ACCEPT_ROUTES` | `false` | Use subnet routes advertised by other nodes. Off by default because it materially widens what the proxy can reach. |
-| `TSPM_REQUIRE_TAILNET_DEST` | **`true`** | The destination guard. See [below](#why-the-destination-guard-exists). |
+| `TSPM_REQUIRE_TAILNET_DEST` | **`true`** | The tailnet destination guard. Applies to `via=ts` mappings only. See [below](#why-the-destination-guards-exist). |
 | `TSPM_METRICS_ADDR` | `127.0.0.1:9090` | Serves `/healthz`, `/readyz`, `/metrics`. Unauthenticated. |
 | `TSPM_DIAL_TIMEOUT` | `10s` | Bounds one onward dial. Go duration syntax. |
 | `TSPM_UP_TIMEOUT` | `90s` | Bounds waiting for the node to reach Running. |
@@ -171,39 +264,54 @@ TSPM_OUT_<NAME> = <proto>,<listen>,<target>[,<key>=<value>]...
 TSPM_IN_<NAME>  = <proto>,<listen>,<target>[,<key>=<value>]...
 ```
 
-Mappings are found by scanning the environment for those two prefixes. There is
-no index and no count variable: you add a relay by adding one variable and
-remove it by deleting that variable, with nothing else to keep in sync. At least
-one mapping is required.
+Mappings are found by scanning the environment for those two prefixes, and
+WireGuard interfaces by scanning for a third, `TSPM_WG_`. There is no index and
+no count variable anywhere: you add a relay or an interface by adding one
+variable and remove it by deleting that variable, with nothing else to keep in
+sync. At least one mapping is required; WireGuard interfaces are optional, and
+each one that is declared must be used by some mapping.
 
 | Field | Rules |
 | --- | --- |
 | `<NAME>` | The part after the prefix. Labels logs and the `mapping` metric label. Must be unique across `TSPM_OUT_*` and `TSPM_IN_*`, compared case-insensitively. |
 | `proto` | `tcp` or `udp`. |
-| `listen` | `host:port`; bracket IPv6 (`[::1]:8080`). **The host is required on `out`** — there is deliberately no default, because the correct bind address is a property of the platform and a wrong guess is either an unreachable listener or an open relay. On `in`, an omitted host (`:443`) means the node's own tailnet addresses. |
-| `target` | `host:port`. The host is required. On `out`, prefer a MagicDNS short name over an FQDN: short names survive a tailnet rename. |
+| `listen` | `host:port`; bracket IPv6 (`[::1]:8080`). **The host is required on `out`** — there is deliberately no default, because the correct bind address is a property of the platform and a wrong guess is either an unreachable listener or an open relay. On `in`, an omitted host (`:443`) means every address this node holds on the mapping's network. On `in` over WireGuard, a named host is rejected and a literal one must be an address the interface's `[Interface] Address` line actually gives it. |
+| `target` | `host:port`. The host is required. Over the tailnet, prefer a MagicDNS short name over an FQDN: short names survive a tailnet rename. Over a WireGuard interface the host **must be a literal IP** — see [below](#wireguard-targets-are-addresses-not-names). |
 
 Options, comma-separated after the target:
 
 | Option | Meaning |
 | --- | --- |
-| `tls=true` | Terminate TLS with the node's own Tailscale certificate. Valid **only** on `in` + `tcp`; rejected anywhere else. Requires MagicDNS and HTTPS certificates enabled on the tailnet. |
+| `via=<network>` | Which network this mapping uses: `ts` (the tailnet, the default), `wg:<name>` (a `TSPM_WG_<NAME>` interface, matched case-insensitively), or `local` (the container's own network, no tunnel). On `out` it chooses the onward dialer; on `in` it chooses the stack the listener is opened on. `via=local` is invalid on `in`, because a listener on the container's network that dials the container's network is what an `out` mapping with `via=local` already spells. |
+| `tls=true` | Terminate TLS with the node's own Tailscale certificate. Valid **only** on `in` + `tcp` + `via=ts`; rejected anywhere else, including over WireGuard — the certificate is issued by Tailscale for this node's MagicDNS name, and a WireGuard interface has no such name. |
 | `allow=CIDR\|CIDR\|…` | Pipe-separated prefixes restricting the source address of an accepted connection. Meaningful chiefly on `out`, where the sources are workloads on your platform's private network; on `in` the sources are tailnet addresses and ACL grants are the better instrument. Omitting it allows any source that can reach the bind address. Single addresses are written `/32` or `/128`. |
 | `idle=<duration>` | Close a session that has moved no bytes in either direction for this long. On TCP, `0` (the default) means never reap. On UDP the default is `60s`, because UDP has no close handshake and an unbounded session table grows forever. |
 
 An unknown option key is a startup error rather than a silently ignored field.
 So is a duplicated option, an empty option field, and two mappings that would
 claim the same listening socket. Two mappings claim the same socket when they
-share a direction, a protocol and a port on an overlapping address — including
-the case where one is a wildcard bind (`:8080`, `0.0.0.0:8080`) that covers the
-address another mapping named explicitly. Different protocols on one port do
-not collide, and neither do opposite directions: an `out` mapping opens a real
-socket on the container's own network, while an `in` mapping's listener lives
-inside tsnet's netstack, bound to the node's tailnet addresses, and never
-creates a socket on the host at all. `TSPM_IN_APP='tcp,:8080,…'` alongside
-`TSPM_OUT_CACHE='tcp,0.0.0.0:8080,…'` is therefore two listeners on two
-separate network stacks, and is accepted. The `<NAME>` still has to differ:
-uniqueness of the name is a separate rule, and it holds across both prefixes.
+share a **listening network**, a protocol and a port on an overlapping address —
+including the case where one is a wildcard bind (`:8080`, `0.0.0.0:8080`) that
+covers the address another mapping named explicitly.
+
+There are as many listening networks as this node holds stacks. Every `out`
+mapping opens a real socket on the container's own network, whatever it dials
+over, so all of them share one address space. Each `in` mapping's listener lives
+inside its own network's netstack — tsnet's, or one WireGuard interface's — and
+never creates a socket on the host at all. So all of the following are accepted
+together, being five listeners on four separate stacks:
+
+```sh
+TSPM_IN_APP='tcp,:8080,127.0.0.1:9000'                       # tsnet's netstack
+TSPM_IN_HQ='tcp,:8080,127.0.0.1:9001,via=wg:hq'              # wg:hq's netstack
+TSPM_IN_DC='tcp,:8080,127.0.0.1:9002,via=wg:dc'              # wg:dc's netstack
+TSPM_OUT_CACHE='tcp,0.0.0.0:8080,cache-1:6379'               # the host's stack
+TSPM_OUT_DNS='udp,0.0.0.0:8080,resolver-1:53'                # UDP: a different socket
+```
+
+Different protocols on one port do not collide either, which is the last line
+above. The `<NAME>` still has to differ: uniqueness of the name is a separate
+rule, and it holds across both prefixes.
 
 ### Worked examples
 
@@ -230,6 +338,29 @@ a bare `:port` is the correct spelling.
 
 ```sh
 TSPM_IN_APP='tcp,:443,127.0.0.1:8080,tls=true,idle=5m'
+```
+
+**Egress over a WireGuard interface.** The target is written as an address
+because the tunnel has no resolver, and `10.8.0.5` must fall inside some peer's
+`AllowedIPs` or startup refuses it:
+
+```sh
+TSPM_WG_HQ='file:/run/secrets/hq.conf'
+TSPM_OUT_APPLIANCE='tcp,0.0.0.0:8443,10.8.0.5:443,via=wg:hq,allow=10.0.0.0/8'
+```
+
+**Ingress from a WireGuard peer.** A peer on the VPN reaches a service on the
+container's own network. The listen address is one the interface holds:
+
+```sh
+TSPM_IN_ADMIN='tcp,10.8.0.2:8080,127.0.0.1:9000,via=wg:hq,allow=10.8.0.0/24'
+```
+
+**A plain forwarder.** No tunnel, no guard — just a local port pointed at
+another address on the container's own network:
+
+```sh
+TSPM_OUT_LEGACY='tcp,0.0.0.0:6379,cache.internal:6379,via=local'
 ```
 
 **A UDP map.** Egress DNS to a tailnet resolver, with the default 60s idle left
@@ -266,10 +397,176 @@ caps are the difference between a bounded worst case and unbounded growth.
 
 ---
 
+## WireGuard interfaces
+
+A WireGuard interface is declared by one variable, found by the same prefix scan
+the mappings use:
+
+```
+TSPM_WG_<NAME> = <wg-quick configuration>   |   file:/path/to/<name>.conf
+```
+
+`<NAME>` is what `via=wg:<name>` refers to, compared case-insensitively. As with
+a mapping, an interface is removed by **deleting** its variable; blanking it is
+a fatal startup error, not an absent interface.
+
+### The format is wg-quick's, unchanged
+
+There is deliberately no bespoke grammar for peers. Every WireGuard deployment
+already has a `.conf` — from `wg genkey`, from a provider's download button,
+from an existing `wg-quick` unit — and pointing tsportmap at it unchanged is
+better than transliterating it into something new and getting one field wrong.
+
+```ini
+[Interface]
+PrivateKey = <base64>
+Address    = 10.8.0.2/24, fd00:8::2/64   # this interface's own addresses
+ListenPort = 51820                       # optional; omit for an ephemeral port
+MTU        = 1420                        # optional; 1420 by default
+
+[Peer]
+PublicKey           = <base64>
+PresharedKey        = <base64>           # optional
+AllowedIPs          = 10.8.0.0/24, 192.168.9.0/24
+Endpoint            = vpn.example.com:51820   # optional for a peer that always initiates
+PersistentKeepalive = 25                 # optional; seconds
+```
+
+**Prefer `file:`.** The text contains a private key, and an inline value puts
+that key in `/proc/<pid>/environ`, in `docker inspect`, and on your platform's
+environment dashboard. Neither the private key nor a preshared key is ever
+logged, quoted in an error, or printed by `--validate`; peers' public keys are,
+because they are public and because matching them against `wg show` on the far
+side is the first thing you do when a tunnel is not carrying traffic.
+
+`DNS =` is accepted and ignored — only so an unedited provider file is not
+rejected. There is no resolver inside the tunnel to point it at; see below.
+
+### wg-quick directives that are refused
+
+`PreUp`, `PostUp`, `PreDown`, `PostDown`, `Table`, `FwMark` and `SaveConfig` are
+**startup errors**, not ignored lines. Every one of them exists to drive a
+kernel interface: they run shell commands, select routing tables, or rewrite the
+file. None of that happens here, and an operator who pastes a working `wg-quick`
+config is entitled to know that the `PostUp` hook which installs their routes is
+not going to run. Silently dropping it would give you an interface that starts,
+looks correct, and carries traffic nowhere near where the file says it should.
+
+Remove the line once you have confirmed nothing depends on it.
+
+### WireGuard targets are addresses, not names
+
+A mapping with `via=wg:<name>` **must write its target as a literal IP**. This
+is the one rule that will surprise you, and it is the same rule the [destination
+guard](#why-the-destination-guards-exist) enforces for the tailnet, arrived at
+from the other direction.
+
+A WireGuard tunnel carries no resolver. If tsportmap resolved a tunnel-side name
+it would have to use the container's own resolver, on the container's own
+network — which would answer with whatever *that* network calls the name. On a
+PaaS dense with RFC1918 addresses that answer is frequently a neighbouring
+service of yours, reached with no error and no log line. Since a WireGuard
+netmap has nothing to check such an answer against afterwards, the only place
+the mistake can be caught is before it is made:
+
+```
+TSPM_OUT_DB: target host "db.internal" is a name, and a mapping using via=wg:hq
+must name its destination by address. A WireGuard tunnel carries no resolver, so
+the name would be resolved on the container's own network and answer with
+whatever that network calls it — a different host from the one inside the
+tunnel, reached with no error. Write the address the peer holds inside the tunnel
+```
+
+A peer's `Endpoint` may still be a name, and usually should be: an endpoint is
+reached *outside* the tunnel, on the same network and with the same resolver as
+any other outbound connection this container makes, so a name there means
+exactly what it means anywhere else.
+
+### What is checked before the process starts
+
+`--validate` runs the same parser startup runs, and these are all startup
+errors rather than first-connection failures:
+
+| Check | Why it is worth failing over |
+| --- | --- |
+| `via=wg:<name>` names a declared interface | Otherwise it fails at bind time as a missing-network error that names neither variable. |
+| Every declared interface is used by some mapping | An unused interface is almost always a `via=` that was meant to name it. It would otherwise sit there handshaking for nothing. |
+| An `out` target is inside some peer's `AllowedIPs` | WireGuard drops a packet it has no peer for, with nothing to report it, so the connection would simply hang until the dial timeout. |
+| The peer an `out` target routes to has an `Endpoint` | A peer with no endpoint can only be reached after it has initiated. That is correct for a road-warrior peer dialling in and broken for one you dial out to. |
+| An `in` listen address is one the interface holds | The bind would fail with an address error that does not mention the `Address` line at fault. |
+| No two peers claim the same `AllowedIPs` prefix | WireGuard routes a destination to exactly one peer, so one of the two would silently stop receiving traffic — which reads as that peer being down. |
+| The interface can establish a tunnel at all | An interface with no peer `Endpoint` and no `ListenPort` can neither dial out nor be dialled in to. |
+| `AllowedIPs` has no bits set below its prefix length | `10.8.0.2/24` where `10.8.0.0/24` was meant is a route wider than the one written, and WireGuard would mask it away silently. |
+
+The same `AllowedIPs` check runs again on every dial, because a refusal there
+has to be a real refusal and not an assumption inherited from startup. It is
+counted under `tsportmap_rejected_total`'s sibling
+`tsportmap_dial_failures_total{reason="no_route"}`.
+
+### Worked example: a vendor appliance behind a partner's VPN
+
+The vendor sent you `partner.conf` and told you the appliance is at
+`10.44.0.9:443`. Your own service needs to reach it, and also needs a tailnet
+database. One container, no privileges:
+
+```sh
+TSPM_AUTHKEY='file:/run/secrets/ts-authkey'
+TSPM_TAGS='tag:proxy'
+TSPM_WG_PARTNER='file:/run/secrets/partner.conf'
+
+TSPM_OUT_DB='tcp,0.0.0.0:5432,db-1:5432,allow=10.0.0.0/8,idle=30m'
+TSPM_OUT_APPLIANCE='tcp,0.0.0.0:8443,10.44.0.9:443,allow=10.0.0.0/8,idle=5m'
+```
+
+Wait — `APPLIANCE` has no `via=`, so it would go over the tailnet and the
+destination guard would refuse `10.44.0.9`. That is the mistake the guard exists
+to catch, and it is caught at the first dial rather than at startup, because
+"is this address a tailnet peer" is a question only the live netmap can answer.
+The correct spelling is:
+
+```sh
+TSPM_OUT_APPLIANCE='tcp,0.0.0.0:8443,10.44.0.9:443,via=wg:partner,allow=10.0.0.0/8,idle=5m'
+```
+
+### Exposing a local service *to* a WireGuard network
+
+The mirror image. A peer on the VPN connects to this node's tunnel address and
+reaches a service on the container's own network:
+
+```sh
+TSPM_IN_ADMIN='tcp,10.8.0.2:8080,127.0.0.1:9000,via=wg:hq,allow=10.8.0.0/24'
+```
+
+The listen address must be one the interface holds. Leaving the host off
+(`:8080`) binds every address it holds, which — unlike tsnet — works for UDP
+too: a WireGuard interface picks the reply source address from its route to the
+peer, so a datagram listener does not have to be pinned to one address.
+
+`allow=` is worth setting here in a way it is not on the tailnet. A tailnet has
+ACL grants as a better instrument; a WireGuard interface has only `AllowedIPs`,
+which is a routing table and not an access-control list — it says which peer a
+packet goes to, not which peer may open a connection.
+
+### What a WireGuard interface needs from the platform
+
+- **Outbound UDP** to each peer's `Endpoint`. That is the entire requirement,
+  and it is the one a PaaS is most likely to quietly not provide. If the
+  handshake gauge stays at `0` and nothing else looks wrong, check this first.
+- **Inbound UDP on `ListenPort`**, but only if a peer must initiate to this
+  node. A node that only ever dials out needs no `ListenPort` at all and should
+  omit it.
+- **Nothing else.** No capabilities, no devices, no sysctls, no volume.
+
+---
+
 ## Required Tailscale setup
 
-This is the number one first-run failure. tsportmap cannot detect a missing ACL
-grant for you — a refused dial looks like a refused dial. Do this part first.
+Skip this section entirely if no mapping uses `via=ts`; a WireGuard-only node
+reads no credential and registers no device.
+
+This is the number one first-run failure for a node that *does* use the tailnet.
+tsportmap cannot detect a missing ACL grant for you — a refused dial looks like
+a refused dial. Do this part first.
 
 ### 1. Mint a credential
 
@@ -386,7 +683,12 @@ give the node durable state.
 
 ---
 
-## Why the destination guard exists
+## Why the destination guards exist
+
+Each network has a guard, they exist for the same reason, and they fail in
+opposite directions — so they are worth reading together.
+
+### The tailnet guard
 
 Suppose you write an egress mapping and typo the target:
 
@@ -438,17 +740,58 @@ to do that — reaching something over an accepted route the netmap does not
 describe well, or debugging — but it is a real loss of a real safety property,
 and tsportmap logs a warning at startup for as long as it is off.
 
+It applies only to `via=ts` mappings. It is a fix for a specific tsnet
+behaviour, and neither of the other networks has that behaviour.
+
+### The WireGuard route guard
+
+A WireGuard netstack cannot fall through to anything: it has one link, and a
+destination no peer's `AllowedIPs` covers has no peer to be sent to. So the
+failure is the opposite of the tailnet's — not a wrong connection that succeeds,
+but a right-looking connection that never completes. wireguard-go drops the
+packet, nothing sends an error back, and the dial hangs until `TSPM_DIAL_TIMEOUT`
+expires. Read as a symptom, that is indistinguishable from a backend that is
+down.
+
+So tsportmap checks the destination against the union of the peers' `AllowedIPs`
+before dialling, and refuses with a message that names what *is* routed:
+
+```
+refusing dial: destination is not routed by this WireGuard interface
+  address=10.99.0.1:80 routes=10.8.0.0/24,192.168.9.0/24
+```
+
+counted under `tsportmap_dial_failures_total{reason="no_route"}`. The same check
+runs at startup against every `out` mapping's target, so the common case — a
+mapping that was never going to work — is a configuration error before the
+process serves anything. It is not *only* a startup check, because `AllowedIPs`
+is the routing table the packet will actually be matched against and a guard
+that assumed the answer would be the wrong kind of guard.
+
+There is no switch to turn it off. Unlike the tailnet guard, disabling it would
+not restore a more permissive behaviour — it would just replace a clear refusal
+with a hang.
+
+### And `via=local` has neither
+
+That is what it is for. A `via=local` mapping is a plain forwarder: it dials the
+container's own network with no tunnel and no guard, and whatever answers at
+that address is what the client reaches. `--validate` says so for every such
+mapping, in as many words, because it is the one mapping kind least like the
+rest of this tool.
+
 ---
 
 ## Platform notes
 
 | Platform | Status | What to know |
 | --- | --- | --- |
-| **Docker / Compose** | Works | Bind `out` mappings to `0.0.0.0` inside the container so sibling containers and published ports can reach them, and control exposure with `-p 127.0.0.1:…` and `allow=`. Mount a named volume at `TSPM_STATE_DIR` to keep the node identity across `compose down`. No capabilities needed at all: `cap_drop: ALL`, `read_only: true` plus a tmpfs for `/tmp`. See [`deploy/docker-compose.yml`](deploy/docker-compose.yml). |
+| **Docker / Compose** | Works | Bind `out` mappings to `0.0.0.0` inside the container so sibling containers and published ports can reach them, and control exposure with `-p 127.0.0.1:…` and `allow=`. Mount a named volume at `TSPM_STATE_DIR` to keep the node identity across `compose down`. No capabilities needed at all: `cap_drop: ALL`, `read_only: true` plus a tmpfs for `/tmp`. See [`deploy/docker-compose.yml`](deploy/docker-compose.yml), and [`deploy/docker-compose.wireguard.yml`](deploy/docker-compose.wireguard.yml) for the same thing with a WireGuard interface alongside the tailnet. |
 | **Render** | Works | Deploy as a **private service** (`type: pserv`), not a web service. See the constraints below. [`deploy/render.yaml`](deploy/render.yaml). |
 | **Fly.io** | Works | The 6PN private network is **IPv6-only**: bind `out` mappings to `[::]:port`, never `0.0.0.0`. Turn off machine auto-stop — a relay that is asleep is a relay that is down, and tsnet has to re-establish its session on every wake. A Fly volume attaches to one machine, so state and multi-machine scaling are mutually exclusive; with more than one machine, use `TSPM_EPHEMERAL=true` and distinct hostnames. |
 | **Railway** | Works | Private networking is **IPv6-only**: bind `[::]:port`. Private DNS names take a moment to become resolvable after a deploy, so an egress target on the Railway side may fail the first dial or two after a restart. A volume pins the service to one replica. |
 | **Kubernetes** | Works, but | Use the [Tailscale operator's `ProxyGroup` egress](https://tailscale.com/kb/1438/kubernetes-operator-cluster-egress) instead unless you have a specific reason not to. It does per-port `matchPort`/`targetPort` mappings, it is supported, and it fits the rest of your manifests. If you do run tsportmap here, give it a PVC for `TSPM_STATE_DIR` (or set `TSPM_EPHEMERAL=true`), and match `runAsUser: 65532` to the image's UID. |
+| **Any platform, for WireGuard** | Works | The whole requirement is **outbound UDP** to each peer's `Endpoint`, plus inbound UDP on `ListenPort` if a peer must initiate to this node. No capabilities, no `/dev/net/tun`, no volume. A platform that blocks outbound UDP gives you an interface that starts cleanly and never handshakes, which is what `tsportmap_wg_peer_last_handshake_seconds` is for. |
 | **Vercel** | **Not supported** | Not a networking limitation — a process-lifecycle one. Vercel runs functions, which are invoked per-request and frozen or torn down between invocations. tsportmap needs an always-on process holding open listening sockets that sibling workloads connect to over a raw TCP or UDP socket. There is nowhere in that execution model for such a process to live, and no address at which siblings could reach it if there were. This is not a configuration problem and there is no workaround; run tsportmap on something that runs containers, and reach it from Vercel over the public internet or through Tailscale directly. |
 
 ### Render specifics
@@ -521,6 +864,30 @@ Read this section as the honest list of what will bite you.
   by a full table under `tsportmap_rejected_total{reason="session_cap"}`, a
   datagram dropped by a full egress queue under
   `tsportmap_rejected_total{reason="queue_full"}`.
+- **A WireGuard tunnel has no resolver, and will not get one.** Targets are
+  literal addresses; see [above](#wireguard-targets-are-addresses-not-names).
+  Implementing a resolver *inside* the tunnel is possible — `DNS =` names the
+  server — and is deliberately not done: it is several hundred lines of DNS
+  client to own and test, and the failure it would prevent is one that a literal
+  address prevents outright. If you need names, put them in the hosts you
+  control and write the addresses here.
+- **Userspace WireGuard is slower than kernel WireGuard.** Every packet crosses
+  a Go channel, a gVisor stack and a userspace crypto path. This is the same
+  constraint `tsnet` has, for the same reason, and the same caveat applies: no
+  benchmarks have been run and none are claimed. If you can have `NET_ADMIN`,
+  the kernel's WireGuard is the faster answer and this is the wrong tool.
+- **A WireGuard peer's endpoint is resolved once, at startup.** wireguard-go
+  re-resolves on its own schedule for a roaming peer, but a peer whose DNS
+  changes while the process runs is not something tsportmap re-reads
+  configuration for — there is no reload signal for anything else either.
+- **MTU is yours to get right.** 1420 is the default and is correct for a
+  1500-byte path. Over a path with less — a tunnel inside another tunnel, some
+  mobile networks — a large packet is dropped rather than fragmented, and TCP
+  presents that as a connection that opens and then stalls on the first big
+  response. Set `MTU` in the `[Interface]` section if you know the path.
+- **Each WireGuard interface has its own netstack and its own memory.** The
+  gVisor buffer-tuning caveat above applies once per interface, not once per
+  process.
 
 ---
 
@@ -558,10 +925,21 @@ the target, so a multi-arch build costs no QEMU.
 Issues and pull requests are welcome. A few standing constraints, so a change
 does not have to be turned away after it is written:
 
-- **`tailscale.com` is the only third-party dependency and stays that way.**
-  Everything else is the standard library — including the metrics exposition,
-  the flag parsing and the configuration parsing. CI fails the build if
+- **No new module may enter `go.sum`.** The dependency set is `tailscale.com`
+  plus the two modules it already pulls in that this names directly —
+  `github.com/tailscale/wireguard-go` and `gvisor.dev/gvisor`. Adding WireGuard
+  support moved three lines from the indirect block to the direct one and
+  changed `go.sum` by nothing at all; that is the bar. Everything else is the
+  standard library, including the metrics exposition, the flag parsing, the
+  configuration parsing and the wg-quick parser. CI fails the build if
   `go mod tidy` produces a diff.
+- **`internal/wgnet/netstack.go` is ours on purpose.** wireguard-go ships a
+  `tun/netstack` that does the same job, and it is pinned to a 2023 gVisor that
+  no longer compiles against the much newer gVisor `tailscale.com` requires —
+  and one build cannot have both. Owning ~200 lines of link-endpoint adapter is
+  what lets one process hold a tailnet node and a WireGuard interface at once.
+  If you update it, `TestInterfaceRelaysTCPOverTheTunnel` stands up two real
+  peered interfaces in-process and is the test that will tell you.
 - **Table-driven tests, and test the failure paths.** Most of what this tool
   exists to get right is a failure mode; a test suite that only covers the happy
   path would not have caught any of them.
