@@ -24,6 +24,10 @@ const (
 	EnvPrefixOut = "TSPM_OUT_"
 	// EnvPrefixIn declares an ingress mapping: TSPM_IN_<NAME>=<spec>.
 	EnvPrefixIn = "TSPM_IN_"
+	// EnvPrefixWG declares a userspace WireGuard interface:
+	// TSPM_WG_<NAME>=<wg-quick config, or file:/path to one>. A mapping reaches
+	// it with via=wg:<name>.
+	EnvPrefixWG = "TSPM_WG_"
 
 	EnvHostname           = "TSPM_HOSTNAME"
 	EnvAuthKey            = "TSPM_AUTHKEY"
@@ -74,7 +78,7 @@ const (
 
 // Mapping option keys, in the order they are reported to an operator who
 // misspells one.
-var mappingOptionKeys = []string{"allow", "idle", "tls"}
+var mappingOptionKeys = []string{"allow", "idle", "tls", "via"}
 
 // FromEnv builds a Config from an os.Environ()-style slice of "KEY=VALUE".
 //
@@ -130,6 +134,10 @@ func FromEnv(environ []string) (*Config, error) {
 		return nil, err
 	}
 
+	if c.WG, err = e.wgInterfaces(); err != nil {
+		return nil, err
+	}
+
 	decls, err := e.mappings()
 	if err != nil {
 		return nil, err
@@ -140,6 +148,9 @@ func FromEnv(environ []string) (*Config, error) {
 			EnvPrefixOut, EnvPrefixIn, EnvPrefixOut, EnvPrefixIn)
 	}
 	if err := checkBinds(decls); err != nil {
+		return nil, err
+	}
+	if err := checkNetworks(decls, c.WG); err != nil {
 		return nil, err
 	}
 
@@ -347,7 +358,9 @@ func parseMapping(varName string, dir Direction, name, spec string) (Mapping, er
 			varName, spec)
 	}
 
-	m := Mapping{Name: name, Dir: dir}
+	// The tailnet is the default network so that a mapping written before
+	// WireGuard existed keeps exactly the meaning it had.
+	m := Mapping{Name: name, Dir: dir, Via: Network{Kind: NetTailnet}}
 
 	switch p := Proto(strings.ToLower(fields[0])); p {
 	case TCP, UDP:
@@ -418,6 +431,12 @@ func parseMapping(varName string, dir Direction, name, spec string) (Mapping, er
 				return Mapping{}, err
 			}
 			m.Allow = prefixes
+		case "via":
+			n, err := parseVia(varName, v)
+			if err != nil {
+				return Mapping{}, err
+			}
+			m.Via = n
 		default:
 			// Unknown keys are fatal. A silently ignored option is how an
 			// allow-list gets lost without anyone noticing.
@@ -429,6 +448,26 @@ func parseMapping(varName string, dir Direction, name, spec string) (Mapping, er
 		return Mapping{}, fmt.Errorf("%s: tls=true is only valid on an %q mapping over %s; this one is %q over %s. "+
 			"TLS is terminated here with the node's own Tailscale certificate, which only makes sense for traffic arriving from the tailnet",
 			varName, In, TCP, m.Dir, m.Proto)
+	}
+	// The certificate comes from the Tailscale control plane and is issued for
+	// this node's MagicDNS name. There is no equivalent on a WireGuard
+	// interface or on the container's own network — nothing there has a name
+	// control would certify — so the combination is refused rather than left to
+	// fail at bind time with a certificate error that names neither setting.
+	if m.TLS && m.Via.Kind != NetTailnet {
+		return Mapping{}, fmt.Errorf("%s: tls=true needs via=%s, but this mapping uses via=%s. "+
+			"The certificate is issued by Tailscale for this node's MagicDNS name, and there is no such name on a WireGuard interface. "+
+			"Terminate TLS in the backend, or put this mapping on the tailnet",
+			varName, NetTailnet, m.Via)
+	}
+	// An ingress mapping listens on its network, and "the container's own
+	// network" on both sides is what an egress mapping with via=local already
+	// spells. One spelling for one thing keeps the conflict rules answerable.
+	if m.Dir == In && m.Via.Kind == NetLocal {
+		return Mapping{}, fmt.Errorf("%s: via=%s is not valid on an %q mapping: an %q mapping listens on the network it names, "+
+			"and a listener on the container's own network that dials the container's own network is what %s<NAME> with via=%s already declares. "+
+			"Write it as %s%s instead",
+			varName, NetLocal, In, In, EnvPrefixOut, NetLocal, EnvPrefixOut, name)
 	}
 
 	// A UDP session has no close handshake, so without a deadline its entry in
@@ -470,15 +509,40 @@ func splitHostPort(varName, field, value string) (host, port string, err error) 
 
 // bind identifies a listening socket for conflict detection.
 //
-// The direction is part of the identity because the two directions do not
-// share an address space: an ingress listener is opened inside tsnet's
-// netstack and never creates a socket on the host, so an "in" and an "out"
-// mapping written identically claim different things and cannot collide.
+// The stack is part of the identity because tsportmap holds several that do not
+// share an address space. An ingress listener is opened inside its network's own
+// netstack — tsnet's, or a WireGuard interface's — and never creates a socket on
+// the host, so an "in" and an "out" mapping written identically claim different
+// things, and two "in" mappings on different WireGuard interfaces claim
+// different things again. Every "out" mapping, whatever network it dials over,
+// binds the one host stack and so shares an address space with all the others.
 type bind struct {
-	dir   Direction
+	stack string
 	proto Proto
 	host  string
 	port  string
+}
+
+// listenStack names the address space a mapping's listener occupies.
+func listenStack(m Mapping) string {
+	if m.Dir == Out {
+		// The container's own network. Which network the onward dial uses
+		// changes nothing about the socket that was opened here.
+		return "host"
+	}
+	return "in:" + m.Via.String()
+}
+
+// stackDescription renders a stack for an operator, who has never seen the key
+// above and should not have to.
+func stackDescription(m Mapping) string {
+	if m.Dir == Out {
+		return "the container's own network"
+	}
+	if m.Via.Kind == NetWireGuard {
+		return fmt.Sprintf("WireGuard interface %s", m.Via.Name)
+	}
+	return "the tailnet"
 }
 
 // checkBinds rejects two mappings that would try to occupy the same listening
@@ -487,7 +551,7 @@ type bind struct {
 func checkBinds(decls []declared) error {
 	exact := make(map[bind]declared, len(decls))
 	type portKey struct {
-		dir   Direction
+		stack string
 		proto Proto
 		port  string
 	}
@@ -504,24 +568,26 @@ func checkBinds(decls []declared) error {
 			return fmt.Errorf("%s: listen %q is not host:port", d.env, d.m.Listen)
 		}
 		host = canonicalHost(host)
+		stack := listenStack(d.m)
+		where := stackDescription(d.m)
 
-		key := bind{dir: d.m.Dir, proto: d.m.Proto, host: host, port: port}
+		key := bind{stack: stack, proto: d.m.Proto, host: host, port: port}
 		if other, dup := exact[key]; dup {
-			return fmt.Errorf("%s and %s are both %q mappings listening on %s %s; a mapping's (direction, proto, listen) triple must be unique",
-				other.env, d.env, d.m.Dir, d.m.Proto, d.m.Listen)
+			return fmt.Errorf("%s and %s both listen on %s %s on %s; a mapping's (listening network, proto, listen) triple must be unique",
+				other.env, d.env, d.m.Proto, d.m.Listen, where)
 		}
 		exact[key] = d
 
-		pk := portKey{dir: d.m.Dir, proto: d.m.Proto, port: port}
+		pk := portKey{stack: stack, proto: d.m.Proto, port: port}
 		if isWildcardHost(host) {
 			if others := onPort[pk]; len(others) > 0 {
-				return fmt.Errorf("%s listens on %s %s, which covers every address on port %s, and %s already listens on %s %s in the same direction (%s)",
-					d.env, d.m.Proto, d.m.Listen, port, others[0].env, others[0].m.Proto, others[0].m.Listen, d.m.Dir)
+				return fmt.Errorf("%s listens on %s %s, which covers every address on port %s, and %s already listens on %s %s on the same network (%s)",
+					d.env, d.m.Proto, d.m.Listen, port, others[0].env, others[0].m.Proto, others[0].m.Listen, where)
 			}
 			wildcards[pk] = d
 		} else if w, ok := wildcards[pk]; ok {
-			return fmt.Errorf("%s listens on %s %s, but %s already listens on %s %s, which covers every address on port %s in the same direction (%s)",
-				d.env, d.m.Proto, d.m.Listen, w.env, w.m.Proto, w.m.Listen, port, d.m.Dir)
+			return fmt.Errorf("%s listens on %s %s, but %s already listens on %s %s, which covers every address on port %s on the same network (%s)",
+				d.env, d.m.Proto, d.m.Listen, w.env, w.m.Proto, w.m.Listen, port, where)
 		}
 		onPort[pk] = append(onPort[pk], d)
 	}
@@ -566,6 +632,7 @@ func (c *Config) LogValue() slog.Value {
 		attrs := []any{
 			slog.String("dir", string(m.Dir)),
 			slog.String("proto", string(m.Proto)),
+			slog.String("via", m.Via.String()),
 			slog.String("listen", m.Listen),
 			slog.String("target", m.Target),
 		}
@@ -585,6 +652,24 @@ func (c *Config) LogValue() slog.Value {
 		maps = append(maps, slog.Group(m.Name, attrs...))
 	}
 
+	// Keys are named but never valued: the configuration text holds the
+	// interface's private key and any preshared key, and a log line is the one
+	// place a secret outlives the rotation that was supposed to retire it.
+	wg := make([]any, 0, len(c.WG))
+	for _, w := range c.WG {
+		peers := make([]string, len(w.Peers))
+		for i, p := range w.Peers {
+			peers[i] = p.PublicKey
+		}
+		wg = append(wg, slog.Group(w.Name,
+			slog.String("addrs", prefixesString(w.Addresses)),
+			slog.Int("listen_port", w.ListenPort),
+			slog.Int("mtu", w.MTU),
+			slog.Int("peers", len(w.Peers)),
+			slog.String("peer_keys", strings.Join(peers, ",")),
+		))
+	}
+
 	return slog.GroupValue(
 		slog.String("hostname", c.Hostname),
 		slog.Bool("auth_key_set", c.AuthKey != ""),
@@ -599,6 +684,15 @@ func (c *Config) LogValue() slog.Value {
 		slog.Duration("up_timeout", c.UpTimeout),
 		slog.Duration("shutdown_grace", c.ShutdownGrace),
 		slog.String("log_level", c.LogLevel),
+		slog.Group("wireguard", wg...),
 		slog.Group("maps", maps...),
 	)
+}
+
+func prefixesString(ps []netip.Prefix) string {
+	parts := make([]string, len(ps))
+	for i, p := range ps {
+		parts[i] = p.String()
+	}
+	return strings.Join(parts, ",")
 }

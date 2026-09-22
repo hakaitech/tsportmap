@@ -153,6 +153,13 @@ func factory(n node) nodeFactory {
 	return func(*config.Config, *slog.Logger) (node, error) { return n, nil }
 }
 
+// noWG is the WireGuard factory for a test whose configuration declares no
+// interfaces. It fails loudly rather than returning a stub, because a test that
+// reached it would have declared an interface it did not mean to.
+func noWG(c config.WGInterface, _ *slog.Logger) (wgInterface, error) {
+	return nil, fmt.Errorf("this test declares no WireGuard interfaces, but one named %q was built", c.Name)
+}
+
 // syncBuffer collects log output. The relays log from their own goroutines
 // through the default logger, so a test that reads the log while the process
 // is still running needs its own lock rather than relying on the handler's.
@@ -253,7 +260,7 @@ func TestRunRejectsBadConfiguration(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			n := &stubNode{}
-			err := run(context.Background(), tc.environ, "test", io.Discard, factory(n))
+			err := run(context.Background(), tc.environ, "test", io.Discard, factory(n), noWG)
 			if err == nil {
 				t.Fatal("want a configuration error, got nil")
 			}
@@ -275,7 +282,7 @@ func TestRunReportsNodeStartFailure(t *testing.T) {
 	n := &stubNode{startErr: errors.New("the supplied auth key was not accepted")}
 	err := run(context.Background(),
 		[]string{"TSPM_OUT_DB=tcp," + listen + ",db:5432", "TSPM_METRICS_ADDR=" + freePort(t)},
-		"test", io.Discard, factory(n))
+		"test", io.Discard, factory(n), noWG)
 	if err == nil || !strings.Contains(err.Error(), "auth key was not accepted") {
 		t.Fatalf("got %v, want the node's own start error", err)
 	}
@@ -307,7 +314,7 @@ func TestRunReportsBindFailureNamingTheMapping(t *testing.T) {
 		"TSPM_METRICS_ADDR=" + freePort(t),
 	}
 
-	runErr := run(context.Background(), environ, "test", io.Discard, factory(&stubNode{}))
+	runErr := run(context.Background(), environ, "test", io.Discard, factory(&stubNode{}), noWG)
 	if runErr == nil {
 		t.Fatal("want a bind error, got nil")
 	}
@@ -333,7 +340,7 @@ func TestRunReportsStatusAddressInUse(t *testing.T) {
 		"TSPM_OUT_DB=tcp," + listen + ",db:5432",
 		"TSPM_METRICS_ADDR=" + taken.Addr().String(),
 	}
-	runErr := run(context.Background(), environ, "test", io.Discard, factory(&stubNode{}))
+	runErr := run(context.Background(), environ, "test", io.Discard, factory(&stubNode{}), noWG)
 	if runErr == nil || !strings.Contains(runErr.Error(), "TSPM_METRICS_ADDR") {
 		t.Fatalf("got %v, want an error naming the status address variable", runErr)
 	}
@@ -395,7 +402,7 @@ func TestRunServesMappingsAndShutsDownCleanly(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var logs syncBuffer
 	done := make(chan error, 1)
-	go func() { done <- run(ctx, environ, "test", &logs, factory(n)) }()
+	go func() { done <- run(ctx, environ, "test", &logs, factory(n), noWG) }()
 
 	waitReady(t, status)
 
@@ -452,7 +459,7 @@ func TestRunServesMappingsAndShutsDownCleanly(t *testing.T) {
 	// One line per mapping, naming what is exposed.
 	log := logs.String()
 	for _, want := range []string{
-		`mapping=DB dir=out proto=tcp listen=` + outTCP + ` target=db:5432`,
+		`mapping=DB dir=out proto=tcp via=ts listen=` + outTCP + ` target=db:5432`,
 		`mapping=WEB dir=in proto=tcp`,
 		`mapping=DNS dir=in proto=udp`,
 	} {
@@ -508,7 +515,7 @@ func TestRunForceClosesStuckSessionsWithoutBurningTheWindow(t *testing.T) {
 	defer cancel()
 	var logs syncBuffer
 	done := make(chan error, 1)
-	go func() { done <- run(ctx, environ, "test", &logs, factory(n)) }()
+	go func() { done <- run(ctx, environ, "test", &logs, factory(n), noWG) }()
 
 	waitReady(t, status)
 
@@ -556,7 +563,7 @@ func TestRunReadinessTracksTheNode(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- run(ctx, environ, "test", io.Discard, factory(n)) }()
+	go func() { done <- run(ctx, environ, "test", io.Discard, factory(n), noWG) }()
 
 	// Liveness is process-local and must stay up even while the tailnet is
 	// unhealthy; readiness must not.

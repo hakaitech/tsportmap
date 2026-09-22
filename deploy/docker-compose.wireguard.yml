@@ -1,0 +1,139 @@
+# One tsportmap node on two private networks at once: a Tailscale tailnet and a
+# conventional WireGuard VPN, with no privileges on either.
+#
+#   TSPM_OUT_POSTGRES   -> the tailnet host "db-1"          (via=ts, the default)
+#   TSPM_OUT_APPLIANCE  -> 10.8.0.9 inside the WireGuard VPN (via=wg:hq)
+#   TSPM_IN_ADMIN       <- a WireGuard peer reaches the "app" container
+#
+# Run from the repository root:
+#     docker compose -f deploy/docker-compose.wireguard.yml up -d
+#
+# Only the three mappings declared below work. There is no SOCKS5 and no HTTP
+# CONNECT, so nothing else on either network is reachable through this node.
+
+name: tsportmap-wireguard
+
+services:
+  tsportmap:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+
+    environment:
+      TSPM_HOSTNAME: tsportmap-multinet
+
+      # Only needed because one mapping below uses via=ts. Delete this, TSPM_TAGS
+      # and the postgres mapping and the node starts with no Tailscale node at
+      # all — no credential read, no device registered.
+      TSPM_AUTHKEY: file:/run/secrets/tsportmap_authkey
+      TSPM_TAGS: tag:proxy
+      TSPM_STATE_DIR: /var/lib/tsportmap
+      TSPM_EPHEMERAL: "false"
+      TSPM_REQUIRE_TAILNET_DEST: "true"
+
+      # ---- the WireGuard interface ---------------------------------------
+      # An ordinary wg-quick .conf, unchanged, read from a file rather than
+      # given inline: the text contains a private key, and an inline value would
+      # put that key in "docker inspect", in this file's git history, and in
+      # /proc/<pid>/environ.
+      #
+      # PreUp/PostUp/PreDown/PostDown/Table/FwMark/SaveConfig in that file are
+      # startup ERRORS, not ignored lines — there is no kernel interface for
+      # them to act on, and an interface that starts while silently skipping the
+      # hook that installs your routes is worse than one that refuses to start.
+      #
+      # The name after TSPM_WG_ is what via=wg:hq refers to, case-insensitively.
+      TSPM_WG_HQ: file:/run/secrets/hq.conf
+
+      # ---- egress over the tailnet ---------------------------------------
+      # No via=, so this is via=ts. A MagicDNS short name is correct here and
+      # survives a tailnet rename.
+      TSPM_OUT_POSTGRES: tcp,0.0.0.0:5432,db-1:5432,allow=172.29.0.0/16,idle=30m
+
+      # ---- egress over WireGuard ------------------------------------------
+      # The target is a literal address, and must be: a WireGuard tunnel carries
+      # no resolver, so a name here would be resolved on THIS container's
+      # network and answer with whatever the compose bridge calls it. tsportmap
+      # refuses a named target for a via=wg mapping at startup for that reason.
+      #
+      # 10.8.0.9 must also fall inside some peer's AllowedIPs in hq.conf, or
+      # startup refuses the mapping rather than letting the first connection
+      # hang until the dial timeout with nothing to explain why.
+      TSPM_OUT_APPLIANCE: tcp,0.0.0.0:8443,10.8.0.9:443,via=wg:hq,allow=172.29.0.0/16,idle=5m
+
+      # ---- ingress from WireGuard -----------------------------------------
+      # A peer on the VPN reaches the "app" container. The listen address must
+      # be one the interface's [Interface] Address line actually gives it;
+      # leaving the host off (":8080") binds every address it holds.
+      #
+      # allow= matters more here than on the tailnet. A tailnet has ACL grants;
+      # a WireGuard interface has only AllowedIPs, which is a routing table and
+      # not an access-control list — it says which peer a packet goes to, not
+      # which peer may open a connection.
+      #
+      # No tls=true: the certificate would come from Tailscale, issued for this
+      # node's MagicDNS name, and a WireGuard interface has no such name. The
+      # combination is refused at startup.
+      TSPM_IN_ADMIN: tcp,10.8.0.2:8080,app:80,via=wg:hq,allow=10.8.0.0/24,idle=5m
+
+      TSPM_METRICS_ADDR: 0.0.0.0:9090
+      TSPM_LOG_LEVEL: info
+
+    secrets:
+      - tsportmap_authkey
+      - hq.conf
+
+    volumes:
+      # Only the tailnet node has an identity to persist. A WireGuard interface
+      # has none: its identity is the private key in its .conf.
+      - tsportmap-state:/var/lib/tsportmap
+
+    # Both tunnels are userspace. WireGuard here is a wireguard-go device over
+    # an in-process gVisor stack, exactly as tsnet is for the tailnet — so this
+    # needs no NET_ADMIN, no /dev/net/tun and no capabilities, which is the
+    # whole reason to run WireGuard this way rather than in a privileged
+    # sidecar.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+    read_only: true
+    tmpfs:
+      - /tmp
+
+    # The one platform requirement a WireGuard interface adds: outbound UDP to
+    # each peer's Endpoint. If the tunnel never handshakes and nothing else
+    # looks wrong, check that first — the interface will start cleanly either
+    # way, because WireGuard has no connect step. Watch
+    # tsportmap_wg_peer_last_handshake_seconds on :9090/metrics; 0 means the
+    # peer has never completed a handshake.
+
+  app:
+    image: nginx:1.29-alpine
+    restart: unless-stopped
+
+secrets:
+  tsportmap_authkey:
+    # See deploy/docker-compose.yml for the full note on how compose mounts
+    # this. The container runs as UID 65532, which must be able to read it.
+    file: ./secrets/tsportmap.authkey
+
+  hq.conf:
+    # The wg-quick configuration, exactly as your VPN provider or your own
+    # `wg genkey` produced it. Keep this directory out of version control:
+    #     install -d -m 0700 deploy/secrets
+    #     install -m 0400 -o 65532 /etc/wireguard/hq.conf deploy/secrets/hq.conf
+    file: ./secrets/hq.conf
+
+volumes:
+  tsportmap-state:
+
+networks:
+  default:
+    ipam:
+      config:
+        # Pinned so the allow= prefixes above name a subnet that is actually
+        # guaranteed rather than whatever Docker happened to hand out.
+        - subnet: 172.29.0.0/16
